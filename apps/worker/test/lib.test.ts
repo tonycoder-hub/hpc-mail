@@ -209,6 +209,29 @@ describe('code-extract 正则', () => {
       expect(resolveVerificationCode('', preview, '', { bodyTruncated: true })).toBe('913472');
     });
 
+    /**
+     * 真实回归用例：Apple 的「Verify your Apple Account email address.」。
+     * 它的前导句归一化后正好 154 字，6 位码落在第 155-161 字，摘要切在 160——
+     * 列表接口拿摘要重新提码只剩 5 位，详情页走完整正文仍是 6 位。
+     */
+    it('Apple 验证码邮件的码正好跨在摘要边界上', () => {
+      const body = [
+        "You've chosen this email address for your Apple Account. To verify this email address",
+        'belongs to you, enter the code below on the email verification page:',
+        '',
+        '472913',
+        '',
+        'This code will expire three hours after this email was sent.',
+      ].join('\n');
+      const subject = 'Verify your Apple Account email address.';
+      const preview = makePreview(body, '');
+
+      expect(extractCodeByRegex(subject, body)).toBe('472913');
+      expect(preview).toHaveLength(PREVIEW_LIMIT);
+      expect(preview.endsWith('47291')).toBe(true);
+      expect(resolveVerificationCode(subject, preview, '472913', { bodyTruncated: true })).toBe('472913');
+    });
+
     it('正文超过提码扫描上限时贴着结尾的候选同样不可信', () => {
       expect(extractCodeByRegex('', `你的验证码：${'。'.repeat(CODE_SCAN_BODY_CHARS)}913472`)).toBe('');
     });
