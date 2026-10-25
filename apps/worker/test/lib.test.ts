@@ -8,8 +8,12 @@ import {
   normalizeEmail,
   validateLocalPart,
 } from '../src/lib/email-address.js';
-import { extractCodeByRegex, resolveVerificationCode } from '../src/services/code-extract.js';
-import { htmlToText, makePreview } from '../src/lib/text.js';
+import {
+  CODE_SCAN_BODY_CHARS,
+  extractCodeByRegex,
+  resolveVerificationCode,
+} from '../src/services/code-extract.js';
+import { htmlToText, makePreview, PREVIEW_LIMIT } from '../src/lib/text.js';
 import { injectAttachmentLinks } from '../src/services/outbound.js';
 import { ipInAllowList } from '../src/lib/ip-allowlist.js';
 import {
@@ -168,6 +172,46 @@ describe('code-extract 正则', () => {
     const text = '您的验证码是 91347\u200B2，请勿泄露';
     expect(extractCodeByRegex('', text)).toBe('913472');
     expect(resolveVerificationCode('', makePreview(text, ''), '')).toBe('913472');
+  });
+
+  /**
+   * 列表接口拿 160 字摘要重新校验提码：码跨在摘要边界上时只剩前几位，
+   * 而 \d{4,8} 对 4-5 位的残码照样成立，一度盖掉收件时按完整正文存下的 6 位码。
+   */
+  describe('摘要边界上的验证码', () => {
+    const filler = '你好，这是一封来自站点的通知邮件，感谢你注册账号并完成邮箱绑定。为了保护账号安全，请查收下面这次操作所需要的信息。';
+    const bodyWithCodeAt = (pad: number) =>
+      `${filler.repeat(3).slice(0, pad)}你的验证码：913472，五分钟内有效。`;
+
+    it.each([
+      ['切掉 1 位只剩 5 位', 149, '91347'],
+      ['切掉 2 位只剩 4 位', 150, '9134'],
+    ])('%s 的摘要不覆盖已存的完整码', (_name, pad, truncated) => {
+      const body = bodyWithCodeAt(pad as number);
+      const preview = makePreview(body, '');
+      // 完整正文始终提得出 6 位；摘要单独看确实只剩残码
+      expect(extractCodeByRegex('', body)).toBe('913472');
+      expect(preview).toHaveLength(PREVIEW_LIMIT);
+      expect(preview.endsWith(truncated as string)).toBe(true);
+      expect(extractCodeByRegex('', preview, { bodyTruncated: true })).toBe('');
+      expect(resolveVerificationCode('', preview, '913472', { bodyTruncated: true })).toBe('913472');
+    });
+
+    it('没取满上限的摘要末尾仍然正常提码', () => {
+      const preview = makePreview('您的验证码是 913472', '');
+      expect(preview.length).toBeLessThan(PREVIEW_LIMIT);
+      expect(resolveVerificationCode('', preview, '')).toBe('913472');
+    });
+
+    it('摘要中间的候选不受截断影响', () => {
+      const preview = makePreview(`你的验证码：913472，请在五分钟内使用。${filler.repeat(3)}`, '');
+      expect(preview).toHaveLength(PREVIEW_LIMIT);
+      expect(resolveVerificationCode('', preview, '', { bodyTruncated: true })).toBe('913472');
+    });
+
+    it('正文超过提码扫描上限时贴着结尾的候选同样不可信', () => {
+      expect(extractCodeByRegex('', `你的验证码：${'。'.repeat(CODE_SCAN_BODY_CHARS)}913472`)).toBe('');
+    });
   });
 });
 

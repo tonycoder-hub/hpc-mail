@@ -66,11 +66,17 @@ function previewOf(source: string, limit: number): string {
   return source.replace(ZERO_WIDTH, '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+/**
+ * 摘要默认长度。列表接口拿摘要重新校验提码，取到这个长度就说明正文被截断过，
+ * 末尾的候选可能已经少了几位，见 code-extract 的 bodyTruncated。
+ */
+export const PREVIEW_LIMIT = 160;
+
 /** 正文纯文本摘要：优先纯文本，回落 html→text，截断到 limit 字符 */
 export function makePreview(
   text: string | undefined | null,
   html: string | undefined | null,
-  limit = 160,
+  limit = PREVIEW_LIMIT,
 ): string {
   return previewOf((text && text.trim()) || htmlToText(html), limit);
 }
@@ -92,6 +98,6 @@ export function mailText(text: string, html: string): MailText {
   const htmlText = () => (converted ??= htmlToText(html));
   return {
     get plain() { return text || htmlText(); },
-    preview: (limit = 160) => previewOf((text && text.trim()) || htmlText(), limit),
+    preview: (limit = PREVIEW_LIMIT) => previewOf((text && text.trim()) || htmlText(), limit),
   };
 }
