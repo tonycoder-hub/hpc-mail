@@ -7,9 +7,13 @@ import {
   MAX_BODY_BYTES,
   MAX_PAGE_SIZE,
   MAX_RECIPIENTS,
+  MAX_TRANSLATE_BATCH_CHARS,
+  MAX_TRANSLATE_SEGMENT_CHARS,
+  MAX_TRANSLATE_SEGMENTS,
   MESSAGE_DIRECTIONS,
   type MessageDirection,
 } from '../constants.js';
+import type { Page } from '../envelope.js';
 import { domainSchema, localPartSchema } from './mailbox.js';
 
 export const emailAddressSchema = z
@@ -50,14 +54,14 @@ export const listMessagesQuerySchema = z.object({
   /** 搜索主题 / 发件人 / 正文 */
   q: z.string().trim().max(256).optional(),
   /**
-   * 可见范围。普通用户忽略（永远只看自己认领地址）。
+   * 可见范围。普通用户仅支持 mine（自己认领及共享收件），其他范围拒绝。
    * admin：缺省/'mine' = 自己认领；'unclaimed' = 未认领地址；'user' = 指定用户（需 userId）。
    */
   scope: z.enum(['mine', 'unclaimed', 'user']).optional(),
   /** admin + scope=user 时指定目标用户 */
   userId: emptyAsUndefined(z.coerce.number().int().positive()),
   /** 增量拉取：只返回 id 大于该值的邮件（配合轮询/长轮询等码，避免漏检） */
-  afterId: z.coerce.number().int().positive().optional(),
+  afterId: emptyAsUndefined(z.coerce.number().int().nonnegative()),
   cursor: emptyAsUndefined(z.string().max(128)),
   limit: emptyAsUndefined(z.coerce.number().int().min(1).max(MAX_PAGE_SIZE)).default(
     DEFAULT_PAGE_SIZE,
@@ -71,6 +75,43 @@ export const listMessagesQuerySchema = z.object({
 export type ListMessagesQuery = z.infer<typeof listMessagesQuerySchema>;
 export type MessageListScope = NonNullable<ListMessagesQuery['scope']>;
 export type MessageMutationScope = 'mine' | 'unclaimed';
+
+/** 详情/线程/附件与批量操作复用同一范围参数，非法范围不能降级成默认范围。 */
+export const messageViewQuerySchema = z.object({
+  scope: z.enum(['mine', 'unclaimed', 'user']).optional(),
+  userId: emptyAsUndefined(z.coerce.number().int().positive()),
+}).superRefine((query, ctx) => {
+  if (query.scope === 'user' && query.userId === undefined) {
+    ctx.addIssue({ code: 'custom', message: 'scope=user 需要 userId', path: ['userId'] });
+  }
+});
+
+/** 发件人过滤：完整地址，或 `@域名` 匹配该域全部发件人 */
+const senderFilterSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .max(254)
+  .refine((v) => /^@[a-z0-9.-]+\.[a-z]{2,}$/.test(v) || /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v), '发件人需为完整地址或 @域名');
+
+export const waitMessagesQuerySchema = z.object({
+  address: emptyAsUndefined(emailAddressSchema),
+  afterId: emptyAsUndefined(z.coerce.number().int().nonnegative()).default(0),
+  timeout: emptyAsUndefined(z.coerce.number().int().min(1).max(50)).default(25),
+  /** 只等指定发件人（完整地址或 @域名）；不匹配的新邮件被跳过 */
+  from: emptyAsUndefined(senderFilterSchema),
+  /** 只等主题包含该文本（不区分大小写）的邮件 */
+  subjectContains: emptyAsUndefined(z.string().trim().min(1).max(200)),
+  /** 只等已提取出验证码的邮件 */
+  hasCode: boolFlag(),
+  scope: z.enum(['mine', 'unclaimed', 'user']).optional(),
+  userId: emptyAsUndefined(z.coerce.number().int().positive()),
+}).superRefine((query, ctx) => {
+  if (query.scope === 'user' && query.userId === undefined) {
+    ctx.addIssue({ code: 'custom', message: 'scope=user 需要 userId', path: ['userId'] });
+  }
+});
+export type WaitMessagesQuery = z.infer<typeof waitMessagesQuerySchema>;
 
 /** 附件文件名：禁路径分隔符与 .. 遍历 */
 export const attachmentFilenameSchema = z
@@ -92,7 +133,8 @@ export const sendAttachmentSchema = z.object({
     .string()
     .min(1)
     .transform((v) => v.replace(/\s+/g, ''))
-    .refine((v) => /^[A-Za-z0-9+/]+={0,2}$/.test(v), '附件需为合法 base64'),
+    .refine((v) => /^[A-Za-z0-9+/]+={0,2}$/.test(v) && v.length % 4 !== 1 &&
+      (!v.endsWith('=') || v.length % 4 === 0), '附件需为合法 base64'),
 });
 
 /** 发件人身份：mailboxId 或 localPart+domain 二选一 */
@@ -113,7 +155,7 @@ const fromSchema = z
 /** 发送邮件共用字段（附件载体由各 schema 各自定义：base64 内联 或 token 引用） */
 const sendMailBaseShape = {
   from: fromSchema,
-  to: z.array(emailAddressSchema).min(1),
+  to: z.array(emailAddressSchema),
   cc: z.array(emailAddressSchema).default([]),
   bcc: z.array(emailAddressSchema).default([]),
   subject: z.string().trim().min(1).max(998),
@@ -130,6 +172,7 @@ function validateSendCommon(
   v: { to: unknown[]; cc: unknown[]; bcc: unknown[]; text?: string; html?: string },
   ctx: z.RefinementCtx,
 ): void {
+  if (v.to.length + v.cc.length + v.bcc.length === 0) ctx.addIssue({ code: 'custom', message: '至少需要一个收件人', path: ['to'] });
   if (v.to.length + v.cc.length + v.bcc.length > MAX_RECIPIENTS) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -137,13 +180,16 @@ function validateSendCommon(
       path: ['to'],
     });
   }
+  const utf8Length = (value: string) => { let bytes = 0; for (const char of value) { const cp = char.codePointAt(0)!; bytes += cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4; } return bytes; };
+  const bytes = utf8Length(v.text ?? '') + utf8Length(v.html ?? '');
+  if (bytes > MAX_BODY_BYTES) ctx.addIssue({ code: 'custom', message: '正文 UTF-8 字节合计超过上限', path: ['body'] });
   if ((v.text ?? '').length === 0 && (v.html ?? '').length === 0) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: '正文不能为空', path: ['body'] });
   }
 }
 
 /**
- * /v1 开放 API：附件以 base64 内联（AI/脚本一步发送，一般不带大附件）。
+ * 基础发送契约：附件以 base64 内联（AI/脚本一步发送，一般不带大附件）。
  * 保留原契约不破坏；附件合计按 base64 解码后字节数估 ≤ MAX_ATTACHMENT_TOTAL_BYTES。
  */
 export const sendMailRequestSchema = z
@@ -165,7 +211,7 @@ export const sendMailRequestSchema = z
 export type SendMailRequest = z.infer<typeof sendMailRequestSchema>;
 
 /**
- * 内部 /api：附件两种来源均可（向后兼容）——
+ * /api 与 /v1：附件两种来源均可（向后兼容）——
  *  · attachmentTokens：前端先分片上传到 R2 再引用（治本：请求体极小、不卡 UI、不超时）
  *  · attachments(base64)：AI / 脚本 / 旧调用方直接内联（与 /v1 一致，skill.md 教的就是这种）
  * 两者可混用，合并后送 sendMail。
@@ -256,9 +302,21 @@ export interface DraftAttachmentMeta {
 /**
  * 变更类操作的作用范围。admin 必须显式传 'unclaimed' 才动未认领地址下的邮件
  * （防漏传参数误改他人已认领邮件）。不能改其他用户已认领地址。
- * /api 从 query 读，/v1 放进 body。
+ * /api 与 /v1 均接受 query 或 body，同一次请求不能传冲突的范围。
  */
 const mutationScopeSchema = z.enum(['mine', 'unclaimed']).optional();
+
+/**
+ * 全部已读：按与列表相同的筛选收窄范围（domain/address/q），只处理自己认领的地址
+ * （admin scope=unclaimed 处理未认领地址）。共享邮件的已读状态属于所有者，任何情况下都不改。
+ */
+export const markAllReadRequestSchema = z.object({
+  scope: mutationScopeSchema,
+  domain: domainSchema.optional(),
+  address: emailAddressSchema.optional(),
+  q: z.string().trim().max(256).optional(),
+});
+export type MarkAllReadRequest = z.infer<typeof markAllReadRequestSchema>;
 
 export const markReadRequestSchema = z.object({
   ids: z.array(z.number().int().positive()).min(1).max(500),
@@ -284,7 +342,25 @@ export const starMessagesRequestSchema = z.object({
 });
 export type StarMessagesRequest = z.infer<typeof starMessagesRequestSchema>;
 
+export interface RecipientOutcome {
+  address: string;
+  status: 'delivered' | 'sent' | 'failed';
+  error?: string;
+}
+
+/** /api 列表页：首页（无 cursor）附带 head 指纹，与 /messages/sync 同算法，只用于比较首页是否变化 */
+export interface MessageListPage extends Page<MessageSummary> {
+  head?: string;
+}
+
+/** /api/messages/sync 轻量轮询：unread 同 /messages/unread-count；head 为当前筛选下首页的指纹 */
+export interface MessageSyncResult {
+  unread: number;
+  head: string;
+}
+
 export interface MessageSummary {
+  recipientOutcomes?: RecipientOutcome[];
   id: number;
   direction: MessageDirection;
   address: string;
@@ -294,6 +370,8 @@ export interface MessageSummary {
   subject: string;
   preview: string;
   verificationCode: string;
+  /** 入站邮件中识别出的验证/登录链接（http/https）；没有则为空串 */
+  verificationLink?: string;
   status: string;
   /** 发送失败/部分失败原因（inbound 与成功发送为空串）；让调用方能识别「假成功」 */
   errorDetail: string;
@@ -304,6 +382,8 @@ export interface MessageSummary {
   hasAttachments: boolean;
   size: number;
   createdAt: string;
+  /** 仅回收站列表返回：进入回收站的时间，用于计算剩余保留天数 */
+  deletedAt?: string;
 }
 
 export interface AttachmentMeta {
@@ -324,10 +404,34 @@ export interface MessageRecipients {
 }
 
 export interface MessageDetail extends MessageSummary {
+  replyTo?: string[];
   recipients: MessageRecipients;
   bodyText: string;
   bodyHtml: string;
   attachments: AttachmentMeta[];
   /** 是否存有原始 .eml，可经 /api/messages/:id/raw 下载 */
   hasRaw: boolean;
+}
+
+/**
+ * 邮件翻译（POST /api/messages/:id/translate，scope 等查询参数同详情）：
+ * segments 是前端从该邮件主题与正文中按文字节点/段落切出的片段，按顺序翻译成简体中文。
+ * 服务端只翻译能在该邮件内容中找到的片段，找不到的原样返回并计入 skipped。
+ */
+export const translateMessageRequestSchema = z.object({
+  segments: z
+    .array(z.string().max(MAX_TRANSLATE_SEGMENT_CHARS))
+    .min(1)
+    .max(MAX_TRANSLATE_SEGMENTS)
+    .refine((items) => items.reduce((sum, item) => sum + item.length, 0) <= MAX_TRANSLATE_BATCH_CHARS, `单次翻译总字符数不能超过 ${MAX_TRANSLATE_BATCH_CHARS}`),
+});
+export type TranslateMessageRequest = z.infer<typeof translateMessageRequestSchema>;
+
+export interface MessageTranslation {
+  /** 与请求 segments 一一对应的简体中文译文 */
+  translations: string[];
+  /** 是否命中服务端缓存（命中不消耗额度） */
+  cached: boolean;
+  /** 未在邮件内容中找到、因此原样返回的片段数 */
+  skipped: number;
 }

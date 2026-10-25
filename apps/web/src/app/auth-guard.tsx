@@ -5,8 +5,12 @@ import { ApiError } from '@/api/errors';
 import { Button } from '@/components/ui/button';
 import { clearAuthToken } from '@/lib/auth-token';
 import { CurrentUserContext, useAuthToken, useSessionQuery } from '@/lib/use-session';
-import { AppShell } from './app-shell';
+import { lazyWithReload } from './chunk-reload';
 import { FullScreenLoader } from './page-loader';
+import { loadAppShell } from './route-modules';
+
+// 外壳不进登录页入口；已登录启动时 boot-prefetch 会与 /auth/me 并行预取它，通常此时已可同步渲染
+const AppShell = lazyWithReload(loadAppShell, (m) => m.AppShell, <FullScreenLoader />);
 
 export function AuthGuard() {
   const token = useAuthToken();
@@ -16,7 +20,10 @@ export function AuthGuard() {
 
   if (!token) return <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />;
   if (isLoading) return <FullScreenLoader />;
-  if (isError || !user) {
+  // 有用户数据（含启动时恢复的缓存）就先渲染外壳，/auth/me 在后台校验：401 由 apiRequest 清 token 回登录页，
+  // 403（如账号已禁用）以服务端为准；网络等临时失败继续用已有数据，列表自带「显示的是缓存内容」提示
+  const rejected = isError && error instanceof ApiError && error.forbidden;
+  if (!user || rejected) {
     const disabled = error instanceof ApiError && error.code === 'user_disabled';
     const logout = () => {
       clearAuthToken();
@@ -58,7 +65,7 @@ export function AuthGuard() {
 
   return (
     <CurrentUserContext.Provider value={user}>
-      <AppShell />
+      <AppShell key={token} />
     </CurrentUserContext.Provider>
   );
 }

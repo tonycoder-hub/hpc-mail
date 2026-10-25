@@ -71,6 +71,16 @@ export const MAX_WAIT_POLLS_PER_USER_PER_MINUTE = 120;
 export const MAX_AUTH_USER_REQUESTS_PER_MINUTE = 600;
 export const MAX_AUTH_GLOBAL_REQUESTS_PER_MINUTE = 5000;
 export const MAX_DRAFT_ATTACHMENTS_PER_USER = 20;
+/** /api 未读数封顶：侧栏只显示到 99+、标题到 999+，数到上限即停；/v1 精确计数 */
+export const UNREAD_COUNT_CAP = 1000;
+/** 批量认领 / 批量可用性检查单次最多处理的地址数 */
+export const MAX_BATCH_CLAIM = 999;
+/** 批量共享单次最多处理的邮箱数 */
+export const MAX_BATCH_SHARE_MAILBOXES = 100;
+/** 每只邮箱最多共享给多少人（替换与批量追加共用） */
+export const MAX_MAILBOX_GRANTEES = 100;
+/** 每个托管域名最多共享给多少位成员 */
+export const MAX_HOSTED_DOMAIN_MEMBERS = 100;
 export const MAX_DRAFT_ATTACHMENT_BYTES_PER_USER = 100 * 1024 * 1024;
 
 /** 用户名：小写字母/数字开头，3-32 位，允许 - _ */
@@ -100,3 +110,8 @@ export const DEFAULT_RESERVED_LOCAL_PARTS = [
   'info',
   'help',
 ] as const;
+
+/** AI 翻译：单次请求的片段数、单片段字符数与总字符数上限（前端据此分批） */
+export const MAX_TRANSLATE_SEGMENTS = 60;
+export const MAX_TRANSLATE_SEGMENT_CHARS = 2000;
+export const MAX_TRANSLATE_BATCH_CHARS = 6000;

@@ -8,7 +8,7 @@ import {
   normalizeEmail,
   validateLocalPart,
 } from '../src/lib/email-address.js';
-import { extractCodeByAi, extractCodeByRegex, resolveVerificationCode } from '../src/services/code-extract.js';
+import { extractCodeByRegex, resolveVerificationCode } from '../src/services/code-extract.js';
 import { injectAttachmentLinks } from '../src/services/outbound.js';
 import { ipInAllowList } from '../src/lib/ip-allowlist.js';
 import {
@@ -18,8 +18,14 @@ import {
   sanitizeMimeType,
 } from '../src/lib/mime.js';
 import { chunk, D1_ID_BATCH, D1_MAX_BOUND_PARAMS, D1_PAIR_BATCH } from '../src/lib/d1.js';
+import { asciiFallbackFilename, buildSecureHeaders } from '../src/lib/attachment-security.js';
 import { generateCode, generateTotpSecret, verifyTotp } from '../src/lib/totp.js';
 import { AppError } from '../src/lib/errors.js';
+import {
+  DEFAULT_PUSHDEER_ENDPOINT,
+  sendPushDeerNotification,
+  validatePushDeerEndpoint,
+} from '../src/services/pushdeer.js';
 
 const SECRET = 'unit-test-secret-key-000000000000';
 
@@ -139,28 +145,6 @@ describe('code-extract 正则', () => {
   it('非 link-only 邮件保留无法被正则覆盖的历史/AI 验证码', () => {
     expect(resolveVerificationCode('Account alert', 'Use the password shown in the app.', '739204')).toBe('739204');
   });
-  it('AI 不接受只存在于 URL 中的 token', async () => {
-    const run = vi.fn(async () => ({ response: '{"code":"A1B2C3"}' }));
-    const fakeEnv = { ai: { run }, ai_model: 'test-model' } as never;
-    const result = await extractCodeByAi(fakeEnv, {
-      subject: 'Account notice',
-      text: 'Open https://example.test/session/A1B2C3 to continue.',
-      html: '',
-    });
-    expect(run).toHaveBeenCalledOnce();
-    expect(result).toBe('');
-  });
-  it('link-only 邮件不会调用 AI 兜底', async () => {
-    const run = vi.fn(async () => ({ response: '{"code":"VGHH62D"}' }));
-    const fakeEnv = { ai: { run }, ai_model: 'test-model' } as never;
-    const result = await extractCodeByAi(fakeEnv, {
-      subject: 'Anthropic one-time link',
-      text: 'Please click the link below: https://example.test/verify/VGHH62D',
-      html: '',
-    });
-    expect(run).not.toHaveBeenCalled();
-    expect(result).toBe('');
-  });
 });
 
 describe('ip-allowlist', () => {
@@ -278,6 +262,30 @@ describe('chunk（D1 100 绑定参数上限）', () => {
   });
 });
 
+describe('附件下载文件名头', () => {
+  it('filename= 兜底只含 ASCII 并保留扩展名，filename* 保留完整 UTF-8', () => {
+    const disposition = buildSecureHeaders('application/pdf', '季度报告 2026.pdf').get('Content-Disposition')!;
+    expect(disposition).toBe(`attachment; filename="_ 2026.pdf"; filename*=UTF-8''${encodeURIComponent('季度报告 2026.pdf')}`);
+    expect(/^[\x20-\x7e]*$/.test(disposition)).toBe(true);
+  });
+
+  it('主干全是非 ASCII 时用 download 代替，扩展名照留；无扩展名也能兜底', () => {
+    expect(asciiFallbackFilename('报告.pdf')).toBe('download.pdf');
+    expect(asciiFallbackFilename('照片.JPG')).toBe('download.JPG');
+    expect(asciiFallbackFilename('合同')).toBe('download');
+    expect(asciiFallbackFilename('résumé-final.docx')).toBe('r_sum_-final.docx');
+    expect(asciiFallbackFilename('invoice.发票')).toBe('invoice');
+    expect(asciiFallbackFilename('.env')).toBe('.env');
+    expect(asciiFallbackFilename('plain-ascii_v2.tar.gz')).toBe('plain-ascii_v2.tar.gz');
+  });
+
+  it("filename* 按 RFC 5987 转义 '()*，图片仍 inline", () => {
+    const headers = buildSecureHeaders('image/png', "截图(1)*.png");
+    expect(headers.get('Content-Disposition')).toBe(`inline; filename="_(1)*.png"; filename*=UTF-8''%E6%88%AA%E5%9B%BE%281%29%2A.png`);
+    expect(headers.get('Content-Type')).toBe('image/png');
+  });
+});
+
 describe('MIME 参数清洗', () => {
   it('剥掉 CRLF 与引号，堵住附件头注入', () => {
     const evil = 'x.png"\r\nContent-Type: text/html\r\n\r\n<h1>INJECTED</h1>';
@@ -309,5 +317,54 @@ describe('encodeBodyBase64（正文行长）', () => {
     const raw = encodeBodyBase64(body).replace(/\r\n/g, '');
     const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
     expect(new TextDecoder().decode(bytes)).toBe(body);
+  });
+});
+
+describe('PushDeer 通知', () => {
+  it('默认端点为官方 api2.pushdeer.com', () => {
+    expect(validatePushDeerEndpoint('')).toBe(DEFAULT_PUSHDEER_ENDPOINT);
+    expect(validatePushDeerEndpoint(undefined)).toBe(DEFAULT_PUSHDEER_ENDPOINT);
+  });
+
+  it('允许合法的第三方/自建 http(s) 端点', () => {
+    expect(validatePushDeerEndpoint('https://push.my-domain.com/path')).toBe('https://push.my-domain.com');
+  });
+
+  it('阻止非法端点协议与内网地址（防 SSRF）', () => {
+    expect(() => validatePushDeerEndpoint('ftp://example.com')).toThrow(AppError);
+    expect(() => validatePushDeerEndpoint('http://localhost:8080')).toThrow(AppError);
+    expect(() => validatePushDeerEndpoint('http://127.0.0.1')).toThrow(AppError);
+    expect(() => validatePushDeerEndpoint('http://192.168.1.1')).toThrow(AppError);
+    expect(() => validatePushDeerEndpoint('http://10.0.0.1')).toThrow(AppError);
+  });
+
+  it('未启用时不发送，force 时可触发', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ code: 0, content: { result: [] } })),
+    );
+
+    // 未启用且非 force → 不调 fetch
+    await sendPushDeerNotification(
+      { enabled: false, pushkey: 'PDU_TEST', endpoint: '' },
+      { subject: 'test', fromAddress: 'a@b.com', fromName: 'A', toAddress: 'c@d.com', body: 'hi' },
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // force → 调用 fetch
+    await sendPushDeerNotification(
+      { enabled: false, pushkey: 'PDU_TEST', endpoint: '' },
+      { subject: 'test', fromAddress: 'a@b.com', fromName: 'A', toAddress: 'c@d.com', code: '654321', body: 'hi' },
+      { force: true },
+    );
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    const call = fetchSpy.mock.calls[0]!;
+    expect(call[0]).toBe('https://api2.pushdeer.com/message/push');
+    const body = JSON.parse(call[1]?.body as string);
+    expect(body.pushkey).toBe('PDU_TEST');
+    expect(body.text).toContain('654321');
+    expect(body.desp).toContain('a@b.com');
+
+    fetchSpy.mockRestore();
   });
 });

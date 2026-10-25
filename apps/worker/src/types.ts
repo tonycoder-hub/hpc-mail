@@ -5,14 +5,20 @@ export interface Env {
   db: D1Database;
   kv: KVNamespace;
   r2: R2Bucket;
-  ai: Ai;
   assets: Fetcher;
   /** send_email binding：Cloudflare 原生发信（仅已验证 destination） */
   email: SendEmail;
-  /** [vars] ai_model：验证码兜底模型 */
-  ai_model: string;
+  /** Canonical web origin for links in relayed mail. */
+  site_origin?: string;
+  build_sha?: string;
   /** secret：JWT 签名密钥 */
   jwt_secret: string;
+  /** secret：托管域名使用的站长 Cloudflare API Token；与 cf_account_id 都配置时才启用托管域名 */
+  cf_api_token?: string;
+  /** secret：站长 Cloudflare 账户 ID（资源 ID 不入库，由 CI 注入） */
+  cf_account_id?: string;
+  /** 托管域名 catch-all 投递的目标脚本名，须与 wrangler.toml 的 name 一致 */
+  worker_name?: string;
 }
 
 /** 内部 API 鉴权后的用户上下文 */

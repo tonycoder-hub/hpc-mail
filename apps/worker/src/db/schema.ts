@@ -1,6 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
-import type { MessageRecipients, UserNotifyPrefs } from '@hpc-mail/shared';
+import type { MessageRecipients, RecipientOutcome, UserMailboxPolicy, UserNotifyPrefs } from '@hpc-mail/shared';
 
 /** 统一时间戳列：unix 毫秒，Drizzle 映射为 Date */
 const createdAtColumn = () =>
@@ -33,10 +33,17 @@ export const users = sqliteTable('users', {
   totpRecoveryCodes: text('totp_recovery_codes', { mode: 'json' }).$type<string[]>(),
   /** 个人转发与通知偏好（JSON）：飞书/通用 webhook/邮箱转发。null=未配置，走默认（管理员则继承旧全局） */
   notifyPrefs: text('notify_prefs', { mode: 'json' }).$type<UserNotifyPrefs>(),
+  /** null=使用公共配置；专属配置只约束新增认领/过户，存量邮箱保持可用。 */
+  mailboxPolicy: text('mailbox_policy', { mode: 'json' }).$type<UserMailboxPolicy>(),
+  mailboxPolicyRevision: integer('mailbox_policy_revision').notNull().default(0),
   createdAt: createdAtColumn(),
   lastLoginAt: integer('last_login_at', { mode: 'timestamp_ms' }),
   lastLoginIp: text('last_login_ip'),
-});
+}, (t) => [
+  // 未认领地址的通知归属（resolveNotifyOwnerIds）每封收件都查一次启用中的管理员；
+  // 部分索引只收这几行，免得每次扫完整张 users。
+  index('idx_users_active_admin').on(t.id).where(sql`${t.role} = 'admin' AND ${t.status} = 'active'`),
+]);
 
 export const mailboxes = sqliteTable(
   'mailboxes',
@@ -65,6 +72,11 @@ export const messages = sqliteTable(
       .notNull()
       .$type<MessageRecipients>()
       .default(sql`'{"to":[],"cc":[],"bcc":[]}'`),
+    replyTo: text('reply_to', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    recipientOutcomes: text('recipient_outcomes', { mode: 'json' }).notNull().$type<RecipientOutcome[]>().default(sql`'[]'`),
+    purgeToken: text('purge_token'),
+    notifyOwnerIds: text('notify_owner_ids', { mode: 'json' }).$type<number[]>(),
+    notificationsQueuedAt: integer('notifications_queued_at', { mode: 'timestamp_ms' }),
     subject: text('subject').notNull().default(''),
     /** 正文前 160 字符纯文本摘要，列表接口只读此列 */
     preview: text('preview').notNull().default(''),
@@ -79,6 +91,8 @@ export const messages = sqliteTable(
     /** 软删除时间；null=正常，有值=在回收站（scheduled 到期后硬删） */
     deletedAt: integer('deleted_at', { mode: 'timestamp_ms' }),
     verificationCode: text('verification_code').notNull().default(''),
+    /** 收件时识别出的验证/登录链接（仅 http/https，≤2048）；识别不到或历史邮件为空串 */
+    verificationLink: text('verification_link').notNull().default(''),
     messageId: text('message_id'),
     inReplyTo: text('in_reply_to'),
     references: text('references').notNull().default(''),
@@ -92,17 +106,25 @@ export const messages = sqliteTable(
   (t) => [
     index('idx_messages_address').on(t.address, t.id),
     index('idx_messages_domain').on(t.domain, t.id),
-    index('idx_messages_direction').on(t.direction, t.id),
-    index('idx_messages_deleted').on(t.deletedAt),
-    // 收件箱主查询（address ∈ 认领地址 + 未删除 + 按 id 倒序）与未读角标的覆盖索引。
-    // D1 不自动跑 ANALYZE，无统计信息时优化器会挑 idx_messages_deleted 沿「未删除」这个
-    // 巨大的等值组倒扫、把地址当残余过滤，代价随全表行数线性增长（20 万行实测 62ms）
+    // 「未删除 + id 倒序」的覆盖索引，替换原 idx_messages_deleted(deleted_at)。
+    // D1 不自动跑 ANALYZE，无统计信息时优化器把 deleted_at IS NULL 当高选择性条件，列表/搜索/
+    // 联系人会沿这个索引倒扫；把 address/direction/is_read 放进索引后残余过滤不必回表，
+    // 新用户/稀疏用户的扫描从回表读整行降为只读索引。原 idx_messages_direction(direction, id)
+    // 必须同时删除，否则收件箱查询会改走它按方向全量倒扫。
+    index('idx_messages_live').on(t.deletedAt, t.id, t.address, t.direction, t.isRead),
+    // 收件箱主查询（address ∈ 认领地址 + 未删除 + 按 id 倒序）。
     index('idx_messages_address_deleted_id').on(t.address, t.deletedAt, t.id),
-    index('idx_messages_direction_read').on(t.direction, t.isRead, t.deletedAt),
+    // 未读角标：按可见地址逐个计数，direction/is_read 在索引内，不读表行。
+    index('idx_messages_visible').on(t.address, t.deletedAt, t.direction, t.isRead),
     index('idx_messages_created_id').on(t.createdAt, t.id),
     index('idx_messages_message_id').on(t.messageId),
     index('idx_messages_in_reply_to').on(t.inReplyTo),
     uniqueIndex('idx_messages_ingest_key').on(t.ingestKey),
+    index('idx_messages_notification_outbox').on(t.createdAt, t.id).where(sql`${t.notifyOwnerIds} IS NOT NULL AND ${t.notificationsQueuedAt} IS NULL AND ${t.deletedAt} IS NULL`),
+    // 清理链路按 purge_token / R2 key 反查，绝大多数行为 NULL，部分索引只收非空行。
+    index('idx_messages_purge_token').on(t.purgeToken).where(sql`${t.purgeToken} IS NOT NULL`),
+    index('idx_messages_body_r2').on(t.bodyR2Key).where(sql`${t.bodyR2Key} IS NOT NULL`),
+    index('idx_messages_raw_r2').on(t.rawR2Key).where(sql`${t.rawR2Key} IS NOT NULL`),
   ],
 );
 
@@ -131,6 +153,7 @@ export const idempotencyRecords = sqliteTable(
       .notNull()
       .default('pending'),
     responseJson: text('response_json'),
+    messageId: integer('message_id'),
     errorDetail: text('error_detail').notNull().default(''),
     updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
     createdAt: createdAtColumn(),
@@ -153,7 +176,7 @@ export const attachments = sqliteTable(
     contentId: text('content_id').notNull().default(''),
     disposition: text('disposition').notNull().default('attachment'),
   },
-  (t) => [index('idx_attachments_message').on(t.messageId)],
+  (t) => [index('idx_attachments_message').on(t.messageId), index('idx_attachments_r2_key').on(t.r2Key), uniqueIndex('idx_attachments_message_object').on(t.messageId, t.r2Key)],
 );
 
 /**
@@ -184,6 +207,24 @@ export const draftAttachments = sqliteTable(
   ],
 );
 
+/**
+ * 共享邮箱：所有者分享自己的地址，管理员可分享任意已认领地址。
+ * 不改变 mailboxes.user_id（唯一认领人），也不参与通知归属。
+ */
+export const mailboxShares = sqliteTable(
+  'mailbox_shares',
+  {
+    mailboxId: integer('mailbox_id').notNull(),
+    userId: integer('user_id').notNull(),
+    grantedBy: integer('granted_by').notNull(),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.mailboxId, t.userId] }),
+    index('idx_mailbox_shares_user').on(t.userId),
+  ],
+);
+
 /** 星标：每用户对某封邮件的标记（messages 不含 user_id，星标独立表关联） */
 export const stars = sqliteTable(
   'stars',
@@ -195,6 +236,93 @@ export const stars = sqliteTable(
   (t) => [
     primaryKey({ columns: [t.userId, t.messageId] }),
     index('idx_stars_message').on(t.messageId),
+  ],
+);
+
+/**
+ * AI 翻译缓存：按邮件 + 待译片段的哈希存译文，同一邮件的所有可见者共用。
+ * 内容来自邮件本身，随邮件永久删除（purgeStatements）一并删除。
+ */
+export const messageTranslations = sqliteTable(
+  'message_translations',
+  {
+    messageId: integer('message_id').notNull(),
+    /** sha256(提示版本 + 模型 + 待译片段 JSON) */
+    cacheKey: text('cache_key').notNull(),
+    /** 与待译片段一一对应的译文 JSON 数组 */
+    translations: text('translations', { mode: 'json' }).notNull().$type<string[]>(),
+    model: text('model').notNull(),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [primaryKey({ columns: [t.messageId, t.cacheKey] })],
+);
+
+/**
+ * 按收件地址记录的 Claude 账号事实，由官方来信归纳（services/claude-facts.ts）。
+ * 不随邮件删除：邮件硬删后后缀的账号与封号统计仍然保留。标志只会由否变是。
+ */
+export const claudeAddressFacts = sqliteTable(
+  'claude_address_facts',
+  {
+    address: text('address').primaryKey(),
+    domain: text('domain').notNull(),
+    paid: integer('paid', { mode: 'boolean' }).notNull().default(false),
+    suspended: integer('suspended', { mode: 'boolean' }).notNull().default(false),
+    firstSeenAt: integer('first_seen_at', { mode: 'timestamp_ms' }).notNull(),
+    suspendedAt: integer('suspended_at', { mode: 'timestamp_ms' }),
+  },
+  (t) => [index('idx_claude_facts_domain').on(t.domain)],
+);
+
+/**
+ * 用户托管域名：zone 建在站长 Cloudflare 账户，用户把 NS 改过来后自动开通收发。
+ * 只操作本表记录过的 zone_id，从不接管账户里已有的 zone。未认领地址的来信自动认领给 user_id。
+ */
+export const hostedDomains = sqliteTable(
+  'hosted_domains',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    domain: text('domain').notNull().unique(),
+    userId: integer('user_id').notNull(),
+    status: text('status', {
+      enum: ['pending', 'provisioning', 'active', 'error', 'moved', 'suspended', 'deleting'],
+    }).notNull().default('pending'),
+    /** 创建请求先占位，zone 建好后回填；null 表示占位后 zone 尚未创建成功 */
+    zoneId: text('zone_id'),
+    nameServers: text('name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    originalNameServers: text('original_name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    originalRegistrar: text('original_registrar').notNull().default(''),
+    /** 以下四列是最近一次核对 Cloudflare 的结果，供状态展示与发信判断 */
+    zoneStatus: text('zone_status').notNull().default(''),
+    routingStatus: text('routing_status').notNull().default(''),
+    catchAllReady: integer('catch_all_ready', { mode: 'boolean' }).notNull().default(false),
+    sendingStatus: text('sending_status').notNull().default(''),
+    sendingTag: text('sending_tag'),
+    /** 公共 DNS 仍能查到 DS 记录：切换 NS 前必须先在注册商关闭 DNSSEC */
+    dnssec: integer('dnssec', { mode: 'boolean' }).notNull().default(false),
+    lastError: text('last_error').notNull().default(''),
+    /** 每位成员在该域名下最多认领的地址数（0=不限） */
+    memberLimit: integer('member_limit').notNull().default(0),
+    checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
+    activatedAt: integer('activated_at', { mode: 'timestamp_ms' }),
+    updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [index('idx_hosted_domains_user').on(t.userId), index('idx_hosted_domains_status').on(t.status, t.checkedAt)],
+);
+
+/** 托管域名成员：可在该域名下认领地址，不改变域名归属，也看不到他人地址的邮件 */
+export const hostedDomainMembers = sqliteTable(
+  'hosted_domain_members',
+  {
+    domainId: integer('domain_id').notNull(),
+    userId: integer('user_id').notNull(),
+    grantedBy: integer('granted_by').notNull(),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.domainId, t.userId] }),
+    index('idx_hosted_domain_members_user').on(t.userId),
   ],
 );
 
@@ -311,3 +439,48 @@ export const adminAuditLogs = sqliteTable(
   },
   (t) => [index('idx_admin_audit_created').on(t.createdAt)],
 );
+
+/** Long-lived delivery links keep an independent R2 reference after sent-mail deletion. */
+export const externalAttachmentLinks = sqliteTable('external_attachment_links', {
+  attachmentId: integer('attachment_id').primaryKey(),
+  r2Key: text('r2_key').notNull(),
+  filename: text('filename').notNull(),
+  mimeType: text('mime_type').notNull(),
+  size: integer('size').notNull(),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+}, (t) => [index('idx_external_links_expiry').on(t.expiresAt), index('idx_external_links_r2').on(t.r2Key)]);
+
+/** Durable garbage references survive failed R2 cleanup. */
+export const storageCleanupJobs = sqliteTable('storage_cleanup_jobs', {
+  r2Key: text('r2_key').primaryKey(),
+  createdAt: createdAtColumn(),
+  lastError: text('last_error').notNull().default(''),
+});
+
+export const notificationJobs = sqliteTable('notification_jobs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  messageId: integer('message_id'),
+  userId: integer('user_id').notNull(),
+  channel: text('channel', { enum: ['feishu', 'pushdeer', 'webhook', 'forward'] }).notNull(),
+  target: text('target').notNull().default(''),
+  payload: text('payload', { mode: 'json' }).notNull().$type<Record<string, unknown>>(),
+  status: text('status', { enum: ['pending', 'processing', 'succeeded', 'failed', 'skipped', 'unknown'] }).notNull().default('pending'),
+  attempts: integer('attempts').notNull().default(0),
+  maxAttempts: integer('max_attempts').notNull(),
+  nextAttemptAt: integer('next_attempt_at', { mode: 'timestamp_ms' }).notNull(),
+  createdAt: createdAtColumn(),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
+  lastAttemptAt: integer('last_attempt_at', { mode: 'timestamp_ms' }),
+  lastError: text('last_error').notNull().default(''),
+  lastHttpStatus: integer('last_http_status'),
+  dedupeKey: text('dedupe_key').notNull().unique(),
+}, (t) => [index('idx_notification_due').on(t.status, t.nextAttemptAt), index('idx_notification_user').on(t.userId, t.createdAt),
+  // 通知健康页按 (用户, 通道) 取最新一条
+  index('idx_notification_user_channel').on(t.userId, t.channel, t.id)]);
+
+/** Temporary references protect delivery objects while sending or copying metadata. */
+export const deliveryObjectLeases = sqliteTable('delivery_object_leases', {
+  r2Key: text('r2_key').notNull(),
+  token: text('token').notNull(),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+}, (t) => [primaryKey({ columns: [t.r2Key, t.token] }), index('idx_delivery_lease_expiry').on(t.expiresAt)]);

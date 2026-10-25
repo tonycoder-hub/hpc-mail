@@ -4,20 +4,26 @@ import {
   feishuSettingSchema,
   gmailForwardSettingSchema,
   notifyWebhookSettingSchema,
+  pushdeerSettingSchema,
   type UpdateNotifyPrefsRequest,
   type UserNotifyPrefs,
 } from '@hpc-mail/shared';
 import { eq, inArray } from 'drizzle-orm';
+import { chunk } from '../lib/d1.js';
 import { createDb } from '../db/client.js';
 import { settings as settingsTable, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
+import { validateFeishuWebhookUrl } from './feishu.js';
+import { validatePushDeerEndpoint } from './pushdeer.js';
+import { validateNotifyWebhookUrl } from './webhook-notify.js';
 
 function clone(prefs: UserNotifyPrefs): UserNotifyPrefs {
   return {
     feishu: { ...prefs.feishu },
     webhook: { ...prefs.webhook },
     forward: { ...prefs.forward, addresses: [...prefs.forward.addresses] },
+    pushdeer: { ...prefs.pushdeer },
   };
 }
 
@@ -32,20 +38,16 @@ function normalize(raw: unknown): UserNotifyPrefs {
   if (w.success) out.webhook = w.data;
   const fw = gmailForwardSettingSchema.safeParse(r.forward);
   if (fw.success) out.forward = fw.data;
+  const pd = pushdeerSettingSchema.safeParse(r.pushdeer);
+  if (pd.success) out.pushdeer = pd.data;
   return out;
 }
 
-/**
- * 读旧全局通知设置（settings 表 feishu/notify_webhook/gmail_forward 三行原始值），
- * 映射成个人偏好结构——仅作为**管理员**首次未配置个人偏好时的继承来源。
- */
-async function readLegacyGlobalNotify(env: Env): Promise<UserNotifyPrefs | null> {
-  const db = createDb(env);
-  const rows = await db
-    .select()
-    .from(settingsTable)
-    .where(inArray(settingsTable.key, ['feishu', 'notify_webhook', 'gmail_forward']))
-    .all();
+/** 旧全局通知设置所在的 settings 键（feishu/notify_webhook/gmail_forward 三行原始值） */
+export const LEGACY_NOTIFY_KEYS = ['feishu', 'notify_webhook', 'gmail_forward'] as const;
+
+/** settings 原始行 → 个人偏好结构；没有任何旧设置行时返回 null */
+function legacyFromRows(rows: { key: string; value: string }[]): UserNotifyPrefs | null {
   if (!rows.length) return null;
   const map = new Map(rows.map((r) => [r.key, r.value]));
   const out = clone(DEFAULT_USER_NOTIFY_PREFS);
@@ -67,6 +69,19 @@ async function readLegacyGlobalNotify(env: Env): Promise<UserNotifyPrefs | null>
 }
 
 /**
+ * 读旧全局通知设置，映射成个人偏好结构——仅作为**管理员**首次未配置个人偏好时的继承来源。
+ */
+async function readLegacyGlobalNotify(env: Env): Promise<UserNotifyPrefs | null> {
+  const db = createDb(env);
+  const rows = await db
+    .select()
+    .from(settingsTable)
+    .where(inArray(settingsTable.key, [...LEGACY_NOTIFY_KEYS]))
+    .all();
+  return legacyFromRows(rows);
+}
+
+/**
  * 读某用户的个人转发/通知偏好。
  * 已配置 → 用之；未配置且为 admin → 继承旧全局设置（平滑迁移，管理员体验不变）；否则默认（全关）。
  */
@@ -84,6 +99,76 @@ export async function getUserNotifyPrefs(env: Env, userId: number): Promise<User
     if (legacy) return legacy;
   }
   return clone(DEFAULT_USER_NOTIFY_PREFS);
+}
+
+/** 通知归属人的启用状态与偏好（投递时需要两者） */
+export interface NotifyOwner {
+  active: boolean;
+  prefs: UserNotifyPrefs;
+}
+
+/** users 表一行（notifyPrefs 为已解析的 JSON 值）→ 归属人状态与偏好；未配置的管理员继承旧全局设置 */
+function ownerFromRow(
+  row: { status: string; role: string; notifyPrefs: unknown },
+  legacy: UserNotifyPrefs | null | undefined,
+): NotifyOwner {
+  let prefs: UserNotifyPrefs;
+  if (row.notifyPrefs) prefs = normalize(row.notifyPrefs);
+  else if (row.role === 'admin') prefs = clone(legacy ?? DEFAULT_USER_NOTIFY_PREFS);
+  else prefs = clone(DEFAULT_USER_NOTIFY_PREFS);
+  return { active: row.status === 'active', prefs };
+}
+
+const needsLegacy = (row: { role: string; notifyPrefs: unknown }) => !row.notifyPrefs && row.role === 'admin';
+
+/**
+ * 一次查询读出多位归属人的状态与偏好（未配置的管理员共用一次旧全局设置读取），
+ * 收件链路据此只读一次、往下传给转发、入队与即时投递。不存在的用户不在结果里。
+ */
+export async function loadNotifyOwners(env: Env, userIds: number[]): Promise<Map<number, NotifyOwner>> {
+  const out = new Map<number, NotifyOwner>();
+  const ids = [...new Set(userIds)];
+  if (!ids.length) return out;
+  const db = createDb(env);
+  let legacy: UserNotifyPrefs | null | undefined;
+  for (const batch of chunk(ids)) {
+    const rows = await db
+      .select({ id: users.id, status: users.status, role: users.role, notifyPrefs: users.notifyPrefs })
+      .from(users)
+      .where(inArray(users.id, batch))
+      .all();
+    for (const row of rows) {
+      if (needsLegacy(row) && legacy === undefined) legacy = await readLegacyGlobalNotify(env);
+      out.set(row.id, ownerFromRow(row, legacy));
+    }
+  }
+  return out;
+}
+
+/** 原生 D1 查询得到的 users 行（notify_prefs 为 JSON 文本） */
+export interface NotifyOwnerRawRow {
+  id: number;
+  status: string;
+  role: string;
+  notify_prefs: string | null;
+}
+
+/**
+ * 与 loadNotifyOwners 相同的映射，数据来自调用方已合批读出的 users 行与旧全局设置行
+ * （收件链路把它们与去重查询合进同一个 D1 batch，不再单独往返）。JSON 损坏时抛出，由调用方降级。
+ */
+export function notifyOwnersFromRows(
+  rows: NotifyOwnerRawRow[],
+  legacyRows: { key: string; value: string }[],
+): Map<number, NotifyOwner> {
+  const out = new Map<number, NotifyOwner>();
+  let legacy: UserNotifyPrefs | null | undefined;
+  for (const raw of rows) {
+    const row = { status: raw.status, role: raw.role, notifyPrefs: raw.notify_prefs === null ? null : JSON.parse(raw.notify_prefs) as unknown };
+    if (needsLegacy(row) && legacy === undefined) legacy = legacyFromRows(legacyRows);
+    out.set(Number(raw.id), ownerFromRow(row, legacy));
+  }
+  return out;
 }
 
 /** 写个人偏好：逐块合并 + secret 掩码保留旧值 + 落库 */
@@ -107,6 +192,26 @@ export async function updateUserNotifyPrefs(
     };
   }
   if (patch.forward) next.forward = { ...patch.forward, addresses: [...patch.forward.addresses] };
+  if (patch.pushdeer) {
+    next.pushdeer = {
+      ...patch.pushdeer,
+      pushkey: patch.pushdeer.pushkey === SECRET_MASK ? current.pushdeer.pushkey : patch.pushdeer.pushkey,
+    };
+  }
+
+  // 保存启用配置时采用与实际投递相同的校验，避免保存成功但永远无法执行。
+  // 未启用的配置可作为未填完整的草稿；空 secret / PushKey 是明确清除，MASK 才是保留。
+  if (patch.feishu && next.feishu.enabled) validateFeishuWebhookUrl(next.feishu.webhookUrl);
+  if (patch.pushdeer && next.pushdeer.enabled) {
+    validatePushDeerEndpoint(next.pushdeer.endpoint);
+    if (!next.pushdeer.pushkey.trim()) throw new AppError('validation_failed', '开启 PushDeer 通知需要 PushKey');
+  }
+  if (patch.webhook && next.webhook.enabled && !validateNotifyWebhookUrl(next.webhook.url)) {
+    throw new AppError('validation_failed', '开启通用 Webhook 需要有效的 HTTPS 公网地址');
+  }
+  if (patch.forward && next.forward.enabled && next.forward.addresses.length === 0) {
+    throw new AppError('validation_failed', '开启邮箱转发需要至少一个目标地址');
+  }
 
   const db = createDb(env);
   const res = await db
@@ -118,11 +223,12 @@ export async function updateUserNotifyPrefs(
   return next;
 }
 
-/** 回显脱敏：feishu / webhook secret 用 SECRET_MASK（保留 configured 状态） */
+/** 回显脱敏：feishu / webhook secret 与 pushdeer pushkey 用 SECRET_MASK（保留 configured 状态） */
 export function maskUserNotifyPrefs(prefs: UserNotifyPrefs): UserNotifyPrefs {
   return {
     ...prefs,
     feishu: { ...prefs.feishu, secret: prefs.feishu.secret ? SECRET_MASK : '' },
     webhook: { ...prefs.webhook, secret: prefs.webhook.secret ? SECRET_MASK : '' },
+    pushdeer: { ...prefs.pushdeer, pushkey: prefs.pushdeer.pushkey ? SECRET_MASK : '' },
   };
 }

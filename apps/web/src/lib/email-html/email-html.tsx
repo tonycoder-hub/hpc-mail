@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
 import { cn } from '@/lib/cn'
 import { sanitizeEmailHtml } from '../sanitize-email-html'
 
@@ -7,6 +7,8 @@ export interface EmailHtmlProps {
   trustedImageOrigins?: string[]
   allowRemoteImages?: boolean
   className?: string
+  /** 正文写入 iframe 后回调正文根节点（每次重新渲染都会换新节点），卸载或重渲染前回调 null */
+  onContentChange?: (content: HTMLElement | null) => void
 }
 
 const FRAME_SANDBOX = 'allow-same-origin allow-popups allow-popups-to-escape-sandbox'
@@ -31,11 +33,22 @@ const frameCsp = (allowRemoteImages: boolean) => [
 const FRAME_BASE_STYLES = `
   :root { color-scheme: light; }
   html, body { margin: 0; min-width: 0; color: #0f172a; background: transparent; }
-  #email-content { min-width: 0; overflow-wrap: anywhere; }
+  body {
+    font-family: 'PingFang SC', 'HarmonyOS Sans SC', 'Noto Sans SC', 'Segoe UI', system-ui, -apple-system, 'Microsoft YaHei', sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  /* flow-root：首尾元素的外边距不再穿透到容器外，测得的高度才包含它们，末段不会被裁掉 */
+  #email-content { display: flow-root; min-width: 0; overflow-wrap: anywhere; }
   #email-content img { max-width: 100%; height: auto; }
   #email-content table { max-width: 100%; }
   #email-content pre { max-width: 100%; overflow: auto; white-space: pre-wrap; }
-  #email-content .remote-image-blocked { display: none !important; }
+  #email-content .remote-image-blocked {
+    display: inline-block; box-sizing: border-box; max-width: 100%; min-width: 24px; min-height: 24px;
+    padding: 4px 6px; overflow: hidden; vertical-align: middle; text-align: center;
+    border: 1px dashed oklch(85% 0.006 260); border-radius: 4px; background: oklch(96.6% 0.003 247);
+    color: oklch(51% 0.012 260); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere;
+  }
 `
 
 export function EmailHtml({
@@ -43,14 +56,17 @@ export function EmailHtml({
   trustedImageOrigins = [],
   allowRemoteImages = true,
   className,
+  onContentChange,
 }: EmailHtmlProps) {
   const frameRef = useRef<HTMLIFrameElement>(null)
   const trustedOriginsKey = trustedImageOrigins.join('\n')
+  const onContentChangeRef = useRef(onContentChange)
+  onContentChangeRef.current = onContentChange
 
+  // 绘制前同步换上可信骨架（含本封邮件的 CSP）并清空旧正文：切换邮件时旧内容不会残留一帧。
   useLayoutEffect(() => {
-    const iframe = frameRef.current
-    const frameDocument = iframe?.contentDocument
-    if (!iframe || !frameDocument) return
+    const frameDocument = frameRef.current?.contentDocument
+    if (!frameDocument) return
 
     // 先创建可信骨架，再用 DOM API 写入正文，避免把邮件字符串插进 raw-text 上下文。
     frameDocument.open()
@@ -66,6 +82,15 @@ export function EmailHtml({
     const style = frameDocument.createElement('style')
     style.textContent = FRAME_BASE_STYLES
     frameDocument.head.replaceChildren(csp, referrer, style)
+    // The key intentionally tracks array contents rather than its reference.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [html, allowRemoteImages, trustedOriginsKey])
+
+  // 消毒与写入正文较重（大邮件可达数百毫秒），放到首帧绘制之后，页头与操作栏先出现。
+  useEffect(() => {
+    const iframe = frameRef.current
+    const frameDocument = iframe?.contentDocument
+    if (!iframe || !frameDocument?.body) return
 
     const content = frameDocument.createElement('div')
     content.id = 'email-content'
@@ -75,6 +100,7 @@ export function EmailHtml({
       allowRemoteImages,
     })
     frameDocument.body.replaceChildren(content)
+    onContentChangeRef.current?.(content)
 
     let animationFrame = 0
     let previousHeight = 0
@@ -108,6 +134,7 @@ export function EmailHtml({
       frameDocument.removeEventListener('load', resize, true)
       cancelAnimationFrame(animationFrame)
       iframe.style.removeProperty('height')
+      onContentChangeRef.current?.(null)
     }
     // The key intentionally tracks array contents rather than its reference.
     // eslint-disable-next-line react-hooks/exhaustive-deps

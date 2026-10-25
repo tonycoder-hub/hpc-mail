@@ -27,7 +27,23 @@ step "首页可访问"
 code=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/")
 [ "$code" = "200" ] || fail "GET / 返回 $code"
 
+step "静态资源边缘直出且缺失哈希资源仍为 404"
+asset=$(curl -fsS "$BASE_URL/" | grep -oE '/assets/[A-Za-z0-9._-]+\.js' | head -1)
+[ -n "$asset" ] || fail "首页未引用 /assets/*.js"
+asset_meta=$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$BASE_URL$asset")
+echo "$asset_meta" | grep -qE '^200 (text|application)/javascript' || fail "现存静态资源响应异常: $asset $asset_meta"
+curl -sS -D - -o /dev/null "$BASE_URL$asset" | tr -d '\r' | grep -qi '^cache-control:.*immutable' || fail "现存静态资源缺少长缓存: $asset"
+missing_asset=$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$BASE_URL/assets/missing-smoke-00000000.js")
+[ "$missing_asset" = "404 text/plain; charset=utf-8" ] || fail "缺失哈希资源未返回 404: $missing_asset"
+
+step "Service Worker 可更新"
+sw_headers=$(curl -sS -D - -o /dev/null "$BASE_URL/sw.js" | tr -d '\r')
+echo "$sw_headers" | head -1 | grep -q ' 200' || fail "/sw.js 未返回 200"
+echo "$sw_headers" | grep -qi '^cache-control:.*no-cache' || fail "/sw.js 缺少 no-cache，紧急关闭版本可能无法及时生效"
+
 step "公开配置合法"
+timing=$(curl -sS -D - -o /dev/null "$BASE_URL/api/config" | tr -d '\r' | grep -i '^server-timing:' || true)
+echo "$timing" | grep -q 'app;dur=' || fail "API 响应缺少 Server-Timing"
 config=$(curl -sS "$BASE_URL/api/config")
 mode=$(echo "$config" | jq -r '.data.registrationMode')
 echo "$mode" | grep -qE '^(closed|invite|open)$' || fail "registrationMode 非法"
@@ -62,6 +78,144 @@ fi
 step "admin 设置可读且密文脱敏"
 settings=$(auth_curl -sS "$BASE_URL/api/admin/settings")
 echo "$settings" | jq -e '.data.register_mode' >/dev/null || fail "settings 结构异常"
+
+step "邮箱与共享邮箱列表可读"
+for endpoint in mailboxes mailboxes/shared mailboxes/shares admin/mailbox-shares; do
+  curl -fsS "$BASE_URL/api/$endpoint" -H "Authorization: Bearer $TOKEN" | jq -e '.data | type == "array"' >/dev/null || fail "$endpoint 结构异常"
+done
+
+step "Claude 0 封号规划与可用性（只读）"
+claude_stats=$(curl -fsS "$BASE_URL/api/admin/settings/domain-claude-stats" -H "Authorization: Bearer $TOKEN")
+jq -e '.data | type == "array" and all(.[]; if .suspended > 0 then .risk == "suspended" else .risk == null end)' \
+  <<< "$claude_stats" >/dev/null || fail "Claude 域名风险未按任意历史封号标记"
+claude_plan=$(curl -fsS "$BASE_URL/api/mailboxes/random-plan?strategy=claude&count=10" -H "Authorization: Bearer $TOKEN")
+jq --argjson stats "$claude_stats" -e '
+  ($stats.data | map(select(.suspended > 0) | .domain)) as $blocked |
+  .data | .strategy == "claude" and (.items | type == "array") and (.pool | type == "array") and
+  all(.items[]; .suspended == 0 and (.domain as $domain | $blocked | index($domain) == null)) and
+  all(.pool[]; . as $domain | $blocked | index($domain) == null) and
+  (.shortfall == 10 - (.items | length))
+' <<< "$claude_plan" >/dev/null || fail "Claude 规划包含有封号域名或结构异常"
+claude_probe="smoke-claude-$(date +%s)"
+suspended_domain=$(jq -r '[.data[] | select(.suspended > 0)][0].domain // empty' <<< "$claude_stats")
+if [ -n "$suspended_domain" ]; then
+  curl -fsS --get "$BASE_URL/api/mailboxes/availability" -H "Authorization: Bearer $TOKEN" \
+    --data-urlencode "localPart=$claude_probe" --data-urlencode "domain=$suspended_domain" --data-urlencode 'strategy=claude' |
+    jq -e '.data.available == false and .data.reason == "claude_suspended"' >/dev/null || fail "Claude 封号域名可用性未拒绝"
+else
+  printf '%s\n' '    （没有历史封号域名，跳过封号域名可用性检查）'
+fi
+zero_domain=$(jq -r '[.data[] | select(.suspended == 0)][0].domain // empty' <<< "$claude_stats")
+if [ -n "$zero_domain" ]; then
+  zero_availability=$(curl -fsS --get "$BASE_URL/api/mailboxes/availability" -H "Authorization: Bearer $TOKEN" \
+    --data-urlencode "localPart=$claude_probe" --data-urlencode "domain=$zero_domain" --data-urlencode 'strategy=claude')
+  if jq -e '.data.available == false and .data.reason == "claude_suspended"' <<< "$zero_availability" >/dev/null; then
+    # 初次统计之后可能刚补录了首条封号；只有最新事实能证实这次拒绝时才通过。
+    fresh_claude_stats=$(curl -fsS "$BASE_URL/api/admin/settings/domain-claude-stats" -H "Authorization: Bearer $TOKEN")
+    jq --arg domain "$zero_domain" -e '.data | any(.[]; .domain == $domain and .suspended > 0 and .risk == "suspended")' \
+      <<< "$fresh_claude_stats" >/dev/null || fail "Claude 零封号域名被拒绝，但最新统计没有对应封号事实"
+  else
+    jq -e '.data | .available == true or (.available == false and (.reason == "taken" or .reason == "quota" or .reason == "domain_limit"))' \
+      <<< "$zero_availability" >/dev/null || fail "Claude 零封号域名可用性未遵循普通权限配额"
+  fi
+else
+  printf '%s\n' '    （没有零封号域名，跳过零封号域名可用性检查）'
+fi
+for namespace in api v1; do
+  curl -fsS "$BASE_URL/$namespace/openapi.json" | jq -e '
+    .components.schemas.ClaimMailboxRequest.properties.strategy.enum == ["uniform", "claude"] and
+    (.components.schemas.ClaimMailboxRequest.required | index("strategy") == null) and
+    any(.paths["/mailboxes/availability"].get.parameters[]; .name == "strategy" and .schema.enum == ["uniform", "claude"]) and
+    (.components.schemas.MailboxAvailability.properties.reason.enum | index("claude_suspended") != null)
+  ' >/dev/null || fail "$namespace Claude 认领契约缺失"
+done
+
+step "通知状态和转发配额可读"
+curl -fsS "$BASE_URL/api/me/notify-prefs/health" -H "Authorization: Bearer $TOKEN" | jq -e '.data | (.channels | type == "array") and (.forward.targets | type == "array")' >/dev/null || fail "通知状态结构异常"
+
+step "最近邮件详情与线程可读"
+message_id=$(echo "$list" | jq -r '.data.items[0].id // empty')
+if [ -n "$message_id" ]; then
+  curl -fsS "$BASE_URL/api/messages/$message_id" -H "Authorization: Bearer $TOKEN" | jq -e '.data | (.bodyText | type == "string") and (.attachments | type == "array") and (.replyTo | type == "array")' >/dev/null || fail "邮件详情结构异常"
+  curl -fsS "$BASE_URL/api/messages/$message_id/thread" -H "Authorization: Bearer $TOKEN" | jq -e '.data.items | type == "array"' >/dev/null || fail "邮件线程结构异常"
+fi
+
+step "OpenAPI 可读"
+curl -fsS "$BASE_URL/v1/openapi.json" | jq -e '.openapi == "3.1.0"' >/dev/null || fail "OpenAPI 结构异常"
+
+step "Agent 技能与会话 API 可发现"
+curl -fsS "$BASE_URL/api/openapi.json" | jq -e '.openapi == "3.1.0" and (.paths["/auth/login"].post.requestBody != null) and (.paths["/admin/settings"].put != null)' >/dev/null || fail "会话 OpenAPI 缺少认证或管理员能力"
+agent_skill=$(curl -fsS "$BASE_URL/skill.md")
+grep -q '^name: hpc-mail$' <<< "$agent_skill" || fail "Agent 技能元数据缺失"
+agent_index=$(curl -fsS "$BASE_URL/llms.txt")
+grep -q '/skill.md' <<< "$agent_index" || fail "Agent 发现入口缺失"
+for reference in auth-and-http mail attachments mailboxes-and-domains notifications administration; do
+  doc_metadata=$(curl -fsS -o /dev/null -w '%{http_code} %{content_type}' "$BASE_URL/references/$reference.md")
+  [ "$doc_metadata" = "200 text/markdown; charset=utf-8" ] || fail "参考文档响应异常: $reference $doc_metadata"
+done
+missing_document=$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$BASE_URL/references/missing-smoke-document.md")
+[ "$missing_document" = "404 text/plain; charset=utf-8" ] || fail "缺失参考文档未返回明确 404: $missing_document"
+
+step "未知 API 返回结构化错误"
+unknown=$(curl -sS -w '\n%{http_code}' "$BASE_URL/v1/missing-smoke-endpoint")
+[ "$(echo "$unknown" | tail -1)" = "404" ] || fail "未知 API 未返回 404"
+echo "$unknown" | head -1 | jq -e '.error.code == "not_found" and (.requestId | type == "string")' >/dev/null || fail "未知 API 错误不可解析"
+
+step "管理员用户搜索和邮箱过户契约"
+curl -fsS "$BASE_URL/api/openapi.json" | jq -e '
+  .paths["/admin/mailboxes/{id}/transfer"].post["x-required-role"] == "admin" and
+  .paths["/admin/users/search"].get["x-required-role"] == "admin" and
+  (.components.schemas.TransferMailboxRequest.required | sort) == ["expectedOwnerId", "userId"]
+' >/dev/null || fail "邮箱过户机器契约缺失"
+admin_id=$(echo "$me" | jq -r '.data.id')
+curl -fsS --get "$BASE_URL/api/admin/users/search" --data-urlencode "q=$ADMIN_USERNAME" \
+  -H "Authorization: Bearer $TOKEN" | jq --argjson userId "$admin_id" -e '
+    .data.items[0].id == $userId and (.data.items | length) <= 20 and
+    (.data.hasMore | type) == "boolean" and (.data.items[0] | keys | sort) == ["id", "role", "username"]
+  ' >/dev/null || fail "管理员用户搜索结构或精确匹配异常"
+transfer_input=$(jq -n --argjson ownerId "$admin_id" '{userId:0,expectedOwnerId:$ownerId}')
+invalid_transfer=$(curl -sS -w '\n%{http_code}' -X POST "$BASE_URL/api/admin/mailboxes/0/transfer" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data-binary "$transfer_input")
+[ "$(echo "$invalid_transfer" | tail -1)" = "400" ] || fail "非法目标用户 ID 未被过户接口拒绝"
+echo "$invalid_transfer" | head -1 | jq -e '.error.code == "validation_failed"' >/dev/null || fail "非法过户请求错误不可解析"
+
+step "用户专属邮箱权限契约与配置回显"
+curl -fsS "$BASE_URL/api/openapi.json" | jq -e '
+  .components.schemas.AdminUser.properties.mailboxPolicy != null and
+  .components.schemas.AdminUser.properties.mailboxPolicyRevision.type == "integer" and
+  .components.schemas.UpdateUserRequest.dependentRequired.mailboxPolicy == ["expectedMailboxPolicyRevision"]
+' >/dev/null || fail "用户专属邮箱权限机器契约缺失"
+curl -fsS "$BASE_URL/api/admin/users" -H "Authorization: Bearer $TOKEN" | jq -e '
+  .data | type == "array" and all(.[];
+    has("mailboxPolicy") and
+    (.mailboxPolicy == null or (.mailboxPolicy | type == "object")) and
+    (.mailboxPolicyRevision | type == "number") and .mailboxPolicyRevision >= 0)
+' >/dev/null || fail "用户邮箱权限配置或版本未正确回显"
+
+step "所有者共享与管理员全站共享契约"
+curl -fsS "$BASE_URL/api/openapi.json" | jq -e '
+  .paths["/mailboxes/shares"].put.requestBody != null and
+  .paths["/mailboxes/shares/{mailboxId}/grantees/{userId}"].delete != null and
+  .paths["/mailboxes/share-users"].get != null and
+  .paths["/admin/mailbox-shares"].put["x-required-role"] == "admin" and
+  .components.schemas.MailboxShareGrant.properties.ownerUserId.type == "integer" and
+  .components.schemas.MailboxShareGrant.properties.ownerUsername.type == "string" and
+  .components.schemas.ReplaceMailboxSharesRequest.properties.expectedOwnerId.type == "integer"
+' >/dev/null || fail "共享邮箱机器契约缺失"
+curl -fsS "$BASE_URL/api/mailboxes/shares" -H "Authorization: Bearer $TOKEN" | jq --argjson ownerId "$admin_id" -e '
+  .data | type == "array" and all(.[]; .ownerUserId == $ownerId and (.ownerUsername | type == "string"))
+' >/dev/null || fail "个人共享名单越出自有邮箱范围"
+curl -fsS "$BASE_URL/api/admin/mailbox-shares" -H "Authorization: Bearer $TOKEN" | jq -e '
+  .data | type == "array" and all(.[];
+    (.ownerUserId | type == "number") and (.ownerUsername | type == "string") and
+    (.grantees | type == "array" and all(.[]; .status == "active" or .status == "disabled")))
+' >/dev/null || fail "全站共享邮箱所有者或成员状态缺失"
+curl -fsS --get "$BASE_URL/api/mailboxes/share-users" --data-urlencode "q=$ADMIN_USERNAME" \
+  -H "Authorization: Bearer $TOKEN" | jq --argjson userId "$admin_id" -e '
+    .data.items[0].id == $userId and .data.items[0].role == "admin" and
+    (.data.items | length) <= 20 and (.data.hasMore | type == "boolean") and
+    (.data.items[0] | keys | sort) == ["id", "role", "username"]
+  ' >/dev/null || fail "共享成员搜索未正确返回管理员候选"
 
 step "注册模式=closed 时注册被拒"
 if [ "$mode" = "closed" ]; then

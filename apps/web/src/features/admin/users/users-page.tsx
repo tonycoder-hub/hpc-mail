@@ -11,6 +11,7 @@ import { QueryErrorState } from '@/components/query-error-state';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { CardList, CardListItem } from '@/components/ui/card-list';
 import { Input } from '@/components/ui/input';
 import { FormField } from '@/components/ui/form-field';
 import { SegmentedControl } from '@/components/ui/segmented-control';
@@ -29,7 +30,9 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { toast } from '@/components/ui/toast';
 import { formatDateTime, formatRelativeTime } from '@/lib/format';
+import { useIsMobile } from '@/lib/use-media-query';
 import { useCurrentUser } from '@/lib/use-session';
+import { MailboxPolicyDialog } from './mailbox-policy-dialog';
 
 function generatePassword(length = 14): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
@@ -210,7 +213,58 @@ function MailboxListDialog({ target, onClose }: { target: AdminUser | null; onCl
   );
 }
 
+function UserActionsMenu({
+  user,
+  isSelf,
+  onViewMail,
+  onViewMailboxes,
+  onMailboxPolicy,
+  onUpdate,
+  onResetPassword,
+  onDelete,
+}: {
+  user: AdminUser;
+  isSelf: boolean;
+  onViewMail: () => void;
+  onViewMailboxes: () => void;
+  onMailboxPolicy: () => void;
+  onUpdate: (patch: Parameters<typeof adminApi.updateUser>[1]) => void;
+  onResetPassword: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <IconButton size="sm" aria-label="更多操作">
+          <MoreHorizontal className="size-4" />
+        </IconButton>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent>
+        <DropdownMenuItem onSelect={onViewMail}>查看邮件</DropdownMenuItem>
+        <DropdownMenuItem onSelect={onViewMailboxes}>查看绑定邮箱</DropdownMenuItem>
+        <DropdownMenuItem disabled={user.role === 'admin'} onSelect={onMailboxPolicy}>邮箱权限</DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem disabled={isSelf} onSelect={() => onUpdate({ role: user.role === 'admin' ? 'user' : 'admin' })}>
+          {user.role === 'admin' ? '降为普通用户' : '设为管理员'}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          disabled={isSelf}
+          onSelect={() => onUpdate({ status: user.status === 'active' ? 'disabled' : 'active' })}
+        >
+          {user.status === 'active' ? '禁用账户' : '启用账户'}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onResetPassword}>重置密码</DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem tone="danger" disabled={isSelf} onSelect={onDelete}>
+          删除用户
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 export function UsersPage() {
+  const isMobile = useIsMobile();
   const currentUser = useCurrentUser();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -222,6 +276,7 @@ export function UsersPage() {
   const [resetting, setResetting] = useState<AdminUser | null>(null);
   const [deleting, setDeleting] = useState<AdminUser | null>(null);
   const [viewingMailboxes, setViewingMailboxes] = useState<AdminUser | null>(null);
+  const [editingMailboxPolicy, setEditingMailboxPolicy] = useState<AdminUser | null>(null);
 
   const update = useMutation({
     mutationFn: ({ id, patch }: { id: number; patch: Parameters<typeof adminApi.updateUser>[1] }) =>
@@ -251,7 +306,7 @@ export function UsersPage() {
     <div className="mx-auto max-w-5xl">
       <PageHeader
         title="用户管理"
-        description="管理平台账户的角色、状态与密码。"
+        description="管理平台账户的角色、状态、密码与邮箱权限。"
         actions={
           <Button onClick={() => setCreateOpen(true)}>
             <UserPlus className="size-4" />
@@ -274,6 +329,52 @@ export function UsersPage() {
         <Skeleton className="h-48 w-full rounded-lg" />
       ) : isError ? (
         <QueryErrorState error={error} onRetry={() => void refetch()} />
+      ) : isMobile ? (
+        <CardList>
+          {users.map((user) => {
+            const isSelf = user.id === currentUser.id;
+            return (
+              <CardListItem
+                key={user.id}
+                title={
+                  <>
+                    <Avatar avatarUrl={user.avatarUrl} name={user.username} className="size-7 text-xs" />
+                    <span className="truncate">{user.username}</span>
+                  </>
+                }
+                meta={
+                  <>
+                    <Badge tone={user.role === 'admin' ? 'accent' : 'neutral'}>
+                      {user.role === 'admin' ? '管理员' : '普通用户'}
+                    </Badge>
+                    <Badge tone={user.status === 'active' ? 'positive' : 'critical'}>
+                      {user.status === 'active' ? '正常' : '已禁用'}
+                    </Badge>
+                    <span>邮箱 {user.mailboxCount} 个</span>
+                    <Badge tone={user.mailboxPolicy ? 'accent' : 'neutral'}>
+                      {user.role === 'admin' ? '权限豁免' : user.mailboxPolicy ? '专属配置' : '公共配置'}
+                    </Badge>
+                    <span title={user.lastLoginAt ? formatDateTime(user.lastLoginAt) : ''}>
+                      {user.lastLoginAt ? `最近登录 ${formatRelativeTime(user.lastLoginAt)}` : '从未登录'}
+                    </span>
+                  </>
+                }
+                actions={
+                  <UserActionsMenu
+                    user={user}
+                    isSelf={isSelf}
+                    onViewMail={() => navigate(`/admin/users/${user.id}/mail`)}
+                    onViewMailboxes={() => setViewingMailboxes(user)}
+                    onMailboxPolicy={() => setEditingMailboxPolicy(user)}
+                    onUpdate={(patch) => update.mutate({ id: user.id, patch })}
+                    onResetPassword={() => setResetting(user)}
+                    onDelete={() => setDeleting(user)}
+                  />
+                }
+              />
+            );
+          })}
+        </CardList>
       ) : (
         <Table>
           <TableHeader>
@@ -282,6 +383,7 @@ export function UsersPage() {
               <TableHead>角色</TableHead>
               <TableHead>状态</TableHead>
               <TableHead>邮箱数</TableHead>
+              <TableHead>邮箱权限</TableHead>
               <TableHead>最近登录</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
@@ -321,49 +423,26 @@ export function UsersPage() {
                       <span className="text-ink-secondary">0</span>
                     )}
                   </TableCell>
+                  <TableCell>
+                    <Badge tone={user.mailboxPolicy ? 'accent' : 'neutral'}>
+                      {user.role === 'admin' ? '权限豁免' : user.mailboxPolicy ? '专属配置' : '公共配置'}
+                    </Badge>
+                  </TableCell>
                   <TableCell className="text-ink-tertiary" title={user.lastLoginAt ? formatDateTime(user.lastLoginAt) : ''}>
                     {user.lastLoginAt ? formatRelativeTime(user.lastLoginAt) : '从未'}
                   </TableCell>
                   <TableCell>
                     <div className="flex justify-end">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <IconButton size="sm" aria-label="更多操作">
-                            <MoreHorizontal className="size-4" />
-                          </IconButton>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent>
-                          <DropdownMenuItem onSelect={() => navigate(`/admin/users/${user.id}/mail`)}>
-                            查看邮件
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => setViewingMailboxes(user)}>查看绑定邮箱</DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem
-                            disabled={isSelf}
-                            onSelect={() =>
-                              update.mutate({ id: user.id, patch: { role: user.role === 'admin' ? 'user' : 'admin' } })
-                            }
-                          >
-                            {user.role === 'admin' ? '降为普通用户' : '设为管理员'}
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            disabled={isSelf}
-                            onSelect={() =>
-                              update.mutate({
-                                id: user.id,
-                                patch: { status: user.status === 'active' ? 'disabled' : 'active' },
-                              })
-                            }
-                          >
-                            {user.status === 'active' ? '禁用账户' : '启用账户'}
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => setResetting(user)}>重置密码</DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem tone="danger" disabled={isSelf} onSelect={() => setDeleting(user)}>
-                            删除用户
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
+                      <UserActionsMenu
+                        user={user}
+                        isSelf={isSelf}
+                        onViewMail={() => navigate(`/admin/users/${user.id}/mail`)}
+                        onViewMailboxes={() => setViewingMailboxes(user)}
+                        onMailboxPolicy={() => setEditingMailboxPolicy(user)}
+                        onUpdate={(patch) => update.mutate({ id: user.id, patch })}
+                        onResetPassword={() => setResetting(user)}
+                        onDelete={() => setDeleting(user)}
+                      />
                     </div>
                   </TableCell>
                 </TableRow>
@@ -374,6 +453,7 @@ export function UsersPage() {
       )}
 
       <MailboxListDialog target={viewingMailboxes} onClose={() => setViewingMailboxes(null)} />
+      <MailboxPolicyDialog target={editingMailboxPolicy} onClose={() => setEditingMailboxPolicy(null)} />
       <ResetPasswordDialog target={resetting} onClose={() => setResetting(null)} />
       <CreateUserDialog open={createOpen} onOpenChange={setCreateOpen} />
       <ConfirmDialog

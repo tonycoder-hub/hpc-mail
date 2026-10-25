@@ -1,18 +1,41 @@
 import { describe, expect, it } from 'vitest';
 import {
   claimMailboxRequestSchema,
+  batchMailboxRequestSchema,
+  claimPlanQuerySchema,
   createApiKeyRequestSchema,
   createInviteRequestSchema,
   DEFAULT_SETTINGS,
+  hostedDomainsSettingSchema,
   feishuSettingSchema,
   listMessagesQuerySchema,
   loginRequestSchema,
+  pushdeerSettingSchema,
   registerRequestSchema,
   sendMailRequestSchema,
   SETTING_SCHEMAS,
+  aiModelSettingSchema,
+  aiModelTestRequestSchema,
+  translateMessageRequestSchema,
+  translationSettingSchema,
+  updateNotifyPrefsRequestSchema,
   updateSettingsRequestSchema,
+  userNotifyPrefsSchema,
   usernameSchema,
 } from '../src/index.js';
+
+describe('批量邮箱数量边界', () => {
+  it('批量请求和随机计划接受 999，拒绝 1000', () => {
+    const items = Array.from({ length: 999 }, (_, index) => ({ localPart: `random${index}`, domain: 'example.com' }));
+    expect(batchMailboxRequestSchema.safeParse({ items }).success).toBe(true);
+    expect(batchMailboxRequestSchema.safeParse({ items: [...items, items[0]] }).success).toBe(false);
+    for (const strategy of ['uniform', 'claude']) {
+      expect(claimPlanQuerySchema.safeParse({ count: '999', strategy }).success).toBe(true);
+      expect(claimPlanQuerySchema.safeParse({ count: '1000', strategy }).success).toBe(false);
+      expect(claimPlanQuerySchema.safeParse({ count: '1.5', strategy }).success).toBe(false);
+    }
+  });
+});
 
 describe('usernameSchema', () => {
   it('接受合法用户名并小写化', () => {
@@ -52,6 +75,16 @@ describe('loginRequestSchema', () => {
 });
 
 describe('claimMailboxRequestSchema', () => {
+  it('单项与批量接受可选策略且拒绝未知策略', () => {
+    const item = { localPart: 'zero', domain: 'hpc.email' };
+    for (const strategy of ['uniform', 'claude']) {
+      expect(claimMailboxRequestSchema.parse({ ...item, strategy })).toEqual({ ...item, strategy });
+      expect(batchMailboxRequestSchema.parse({ items: [{ ...item, strategy }] }).items[0]!.strategy).toBe(strategy);
+    }
+    expect(claimMailboxRequestSchema.safeParse({ ...item, strategy: 'unknown' }).success).toBe(false);
+    expect(batchMailboxRequestSchema.safeParse({ items: [{ ...item, strategy: 'unknown' }] }).success).toBe(false);
+    expect(SETTING_SCHEMAS.claim_random.parse({ paidSuspendedLimit: 0, suspendedPercent: 0 })).toMatchObject({ paidSuspendedLimit: 0, suspendedPercent: 0 });
+  });
   it('接受并归一化', () => {
     const r = claimMailboxRequestSchema.parse({ localPart: ' Test.User+tag ', domain: 'HPC.email' });
     expect(r).toEqual({ localPart: 'test.user+tag', domain: 'hpc.email' });
@@ -151,6 +184,41 @@ describe('settings', () => {
   });
 });
 
+describe('notifyPrefs schemas', () => {
+  it('pushdeerSettingSchema 验证合法与默认值', () => {
+    const valid = pushdeerSettingSchema.parse({ enabled: true, pushkey: 'PDU123' });
+    expect(valid.enabled).toBe(true);
+    expect(valid.pushkey).toBe('PDU123');
+    expect(valid.endpoint).toBe('');
+
+    const withEndpoint = pushdeerSettingSchema.parse({
+      enabled: true,
+      endpoint: 'https://pushdeer.example.com',
+      pushkey: 'PDU123',
+    });
+    expect(withEndpoint.endpoint).toBe('https://pushdeer.example.com');
+  });
+
+  it('userNotifyPrefsSchema 兼容缺失 pushdeer 字段的历史数据', () => {
+    const legacy = {
+      feishu: { enabled: false, webhookUrl: '', secret: '', contentLevel: 'summary' },
+      webhook: { enabled: false, url: '', secret: '' },
+      forward: { enabled: false, addresses: [] },
+    };
+    const parsed = userNotifyPrefsSchema.parse(legacy);
+    expect(parsed.pushdeer).toEqual({ enabled: false, endpoint: '', pushkey: '' });
+  });
+
+  it('updateNotifyPrefsRequestSchema 支持单独更新 pushdeer', () => {
+    expect(updateNotifyPrefsRequestSchema.safeParse({}).success).toBe(false);
+    expect(
+      updateNotifyPrefsRequestSchema.safeParse({
+        pushdeer: { enabled: true, pushkey: 'PDU123', endpoint: '' },
+      }).success,
+    ).toBe(true);
+  });
+});
+
 describe('createApiKeyRequestSchema / createInviteRequestSchema', () => {
   it('api key 默认限流且 scope 必填', () => {
     const r = createApiKeyRequestSchema.parse({ name: 'script', scopes: ['mail.read'] });
@@ -161,5 +229,38 @@ describe('createApiKeyRequestSchema / createInviteRequestSchema', () => {
     const r = createInviteRequestSchema.parse({});
     expect(r.count).toBe(1);
     expect(r.maxUses).toBe(1);
+  });
+});
+
+describe('AI 模型与翻译契约', () => {
+  it('模型只接受 https 根地址，默认未配置；翻译默认关闭且不含模型字段', () => {
+    expect(DEFAULT_SETTINGS.ai_model).toEqual({ baseUrl: '', apiKey: '', model: '' });
+    expect(DEFAULT_SETTINGS.translation).toEqual({ enabled: false, dailyCharsPerUser: 200_000 });
+    expect(aiModelSettingSchema.safeParse({ baseUrl: 'http://api.deepseek.com', apiKey: 'k', model: 'm' }).success).toBe(false);
+    expect(aiModelSettingSchema.parse({})).toEqual({ baseUrl: '', apiKey: '', model: '' });
+    expect(translationSettingSchema.parse({ enabled: true, baseUrl: 'https://x.example' })).toEqual({ enabled: true, dailyCharsPerUser: 200_000 });
+  });
+  it('翻译片段数量、单段与总字符数受限', () => {
+    expect(translateMessageRequestSchema.safeParse({ segments: [] }).success).toBe(false);
+    expect(translateMessageRequestSchema.safeParse({ segments: Array(61).fill('a') }).success).toBe(false);
+    expect(translateMessageRequestSchema.safeParse({ segments: ['a'.repeat(2001)] }).success).toBe(false);
+    expect(translateMessageRequestSchema.safeParse({ segments: Array(4).fill('a'.repeat(1600)) }).success).toBe(false);
+    expect(translateMessageRequestSchema.safeParse({ segments: Array(3).fill('a'.repeat(2000)) }).success).toBe(true);
+  });
+  it('测试请求的字段都可省略，不填默认值', () => {
+    expect(aiModelTestRequestSchema.parse({})).toEqual({});
+    expect(aiModelTestRequestSchema.parse({ apiKey: ' ****** ' })).toEqual({ apiKey: '******' });
+    expect(aiModelTestRequestSchema.safeParse({ baseUrl: 'http://x.example' }).success).toBe(false);
+  });
+});
+
+describe('托管域名设置', () => {
+  it('自动认领上限默认 0（不限），可设为 0–100000', () => {
+    const base = { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7 };
+    expect(hostedDomainsSettingSchema.parse(base).autoClaimLimit).toBe(0);
+    expect(DEFAULT_SETTINGS.hosted_domains.autoClaimLimit).toBe(0);
+    expect(hostedDomainsSettingSchema.parse({ ...base, autoClaimLimit: 0 }).autoClaimLimit).toBe(0);
+    expect(hostedDomainsSettingSchema.parse({ ...base, autoClaimLimit: 500 }).autoClaimLimit).toBe(500);
+    for (const bad of [-1, 100001, 1.5]) expect(hostedDomainsSettingSchema.safeParse({ ...base, autoClaimLimit: bad }).success).toBe(false);
   });
 });

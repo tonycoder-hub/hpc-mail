@@ -1,26 +1,41 @@
 import type {
+  MailboxTransferResult,
+  TransferMailboxRequest,
+  UserSearchResults,
   AdminAuditLogEntry,
   AdminUser,
+  BatchClaimMailboxResult,
+  BatchMailboxRequest,
+  BatchShareMailboxesRequest,
   ApiKeySummary,
   ApiRequestLogEntry,
   ChangePasswordRequest,
   ClaimMailboxRequest,
+  ClaimPlan,
+  ClaimPlanStrategy,
   CompleteMultipartUploadRequest,
   CreateApiKeyRequest,
   CreatedApiKey,
   CreateInviteRequest,
   CreateUserRequest,
   DisableTwoFactorRequest,
+  DomainClaudeStats,
   DomainOnboardingStatus,
   InitMultipartUploadRequest,
   InternalSendMailRequest,
   Invite,
   ListMessagesQuery,
   LoginRequest,
+  MarkAllReadRequest,
   LoginResponse,
   Mailbox,
   MailboxAvailability,
+  MailboxShareGrant,
+  ReplaceMailboxSharesRequest,
+  SharedMailboxView,
   MessageDetail,
+  MessageListPage,
+  MessageSyncResult,
   MessageSummary,
   MultipartCompleteResult,
   MultipartInitResult,
@@ -39,6 +54,7 @@ import type {
   UploadAvatarRequest,
   UploadedPart,
   UserNotifyPrefs,
+  NotificationHealth,
   TwoFactorEnabled,
   TwoFactorSetup,
 } from '@hpc-mail/shared';
@@ -68,7 +84,7 @@ export const configApi = {
   getPublic: () => api.get<PublicConfig>('/config', { token: null }),
 };
 
-// ---- 可见域名（需登录，按角色：管理员=全部，普通用户=公开子集）----
+// ---- 可认领域名（需登录，按公共或用户专属规则）----
 export const domainApi = {
   visible: () => api.get<string[]>('/domains'),
 };
@@ -79,6 +95,9 @@ export const notifyPrefsApi = {
   update: (body: UpdateNotifyPrefsRequest) =>
     api.put<UserNotifyPrefs, UpdateNotifyPrefsRequest>('/me/notify-prefs', body),
   testFeishu: () => api.post<{ ok: boolean }>('/me/notify-prefs/feishu-test'),
+  testPushdeer: () => api.post<{ ok: boolean }>('/me/notify-prefs/pushdeer-test'),
+  health: () => api.get<NotificationHealth>('/me/notify-prefs/health'),
+  retry: (id: number) => api.post<{ ok: boolean }>(`/me/notify-prefs/jobs/${id}/retry`),
 };
 
 // ---- 邮箱 ----
@@ -91,19 +110,39 @@ export const mailboxApi = {
     api.delete<{ success: boolean; deletedMessages: number }>(`/mailboxes/${id}`, undefined, {
       query: { deleteHistory: deleteHistory ? 1 : undefined },
     }),
-  availability: (localPart: string, domain: string) =>
-    api.get<MailboxAvailability>('/mailboxes/availability', { query: { localPart, domain } }),
+  availability: (localPart: string, domain: string, strategy?: ClaimMailboxRequest['strategy']) =>
+    api.get<MailboxAvailability>('/mailboxes/availability', { query: { localPart, domain, strategy } }),
+  batchAvailability: (items: ClaimMailboxRequest[]) =>
+    api.post<MailboxAvailability[], BatchMailboxRequest>('/mailboxes/availability/batch', { items }),
+  batchClaim: (items: ClaimMailboxRequest[]) =>
+    api.post<BatchClaimMailboxResult, BatchMailboxRequest>('/mailboxes/batch', { items }),
+  /** 随机后缀分配：只返回为当前用户分好的后缀，不认领 */
+  randomPlan: (count: number, strategy: ClaimPlanStrategy) =>
+    api.get<ClaimPlan>('/mailboxes/random-plan', { query: { count, strategy } }),
+  shared: () => api.get<SharedMailboxView[]>('/mailboxes/shared'),
+  listShares: () => api.get<MailboxShareGrant[]>('/mailboxes/shares'),
+  replaceShares: (body: ReplaceMailboxSharesRequest) =>
+    api.put<MailboxShareGrant, ReplaceMailboxSharesRequest>('/mailboxes/shares', body),
+  /** 把自己的多只邮箱一次共享给同一批用户：追加到各自名单，返回每只邮箱更新后的完整名单 */
+  batchShare: (body: BatchShareMailboxesRequest) =>
+    api.post<MailboxShareGrant[], BatchShareMailboxesRequest>('/mailboxes/shares/batch', body),
+  searchShareUsers: (q: string, excludeUserId?: number, signal?: AbortSignal) =>
+    api.get<UserSearchResults>('/mailboxes/share-users', { query: { q, excludeUserId }, signal }),
 };
 
 // ---- 邮件 ----
 export const messageApi = {
-  list: (query: Partial<ListMessagesQuery>) =>
-    api.get<Page<MessageSummary>>('/messages', { query: query as unknown as QueryParams }),
-  detail: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }) =>
-    api.get<MessageDetail>(`/messages/${id}`, { query: { scope: view?.scope, userId: view?.userId } }),
-  thread: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }) =>
+  list: (query: Partial<ListMessagesQuery>, signal?: AbortSignal) =>
+    api.get<MessageListPage>('/messages', { query: query as unknown as QueryParams, signal }),
+  /** 轻量轮询：未读数 + 当前筛选下首页指纹；与列表首页的 head 不同才需要重拉列表 */
+  sync: (query: Partial<ListMessagesQuery>, signal?: AbortSignal) =>
+    api.get<MessageSyncResult>('/messages/sync', { query: query as unknown as QueryParams, signal }),
+  detail: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }, signal?: AbortSignal) =>
+    api.get<MessageDetail>(`/messages/${id}`, { query: { scope: view?.scope, userId: view?.userId }, signal }),
+  thread: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }, signal?: AbortSignal) =>
     api.get<{ items: MessageSummary[] }>(`/messages/${id}/thread`, {
       query: { scope: view?.scope, userId: view?.userId },
+      signal,
     }),
   contacts: () => api.get<{ contacts: string[] }>('/messages/contacts'),
   send: (body: InternalSendMailRequest, idempotencyKey?: string) =>
@@ -112,24 +151,26 @@ export const messageApi = {
     }),
   unreadCount: () => api.get<{ unread: number }>('/messages/unread-count'),
   markRead: (ids: number[], isRead: boolean, scope?: 'mine' | 'unclaimed') =>
-    api.post<void, { ids: number[]; isRead: boolean }>('/messages/read', { ids, isRead }, { query: { scope } }),
-  markAllRead: () => api.post<{ changed: number }, Record<string, never>>('/messages/read-all', {}),
+    api.post<{ changed: number }, { ids: number[]; isRead: boolean }>('/messages/read', { ids, isRead }, { query: { scope } }),
+  /** 按筛选（domain/address/q）收窄范围的全部已读；只处理自己认领的地址 */
+  markAllRead: (body: MarkAllReadRequest = {}) =>
+    api.post<{ changed: number }, MarkAllReadRequest>('/messages/read-all', body),
   star: (
     ids: number[],
     starred: boolean,
     view?: { scope?: ListMessagesQuery['scope']; userId?: number },
   ) =>
-    api.post<void, { ids: number[]; starred: boolean }>(
+    api.post<{ changed: number }, { ids: number[]; starred: boolean }>(
       '/messages/star',
       { ids, starred },
       { query: { scope: view?.scope, userId: view?.userId } },
     ),
   remove: (ids: number[], scope?: 'mine' | 'unclaimed') =>
-    api.post<void, { ids: number[] }>('/messages/delete', { ids }, { query: { scope } }),
+    api.post<{ deleted: number }, { ids: number[] }>('/messages/delete', { ids }, { query: { scope } }),
   restore: (ids: number[], scope?: 'mine' | 'unclaimed') =>
-    api.post<void, { ids: number[] }>('/messages/restore', { ids }, { query: { scope } }),
+    api.post<{ changed: number }, { ids: number[] }>('/messages/restore', { ids }, { query: { scope } }),
   purge: (ids: number[], scope?: 'mine' | 'unclaimed') =>
-    api.post<void, { ids: number[] }>('/messages/purge', { ids }, { query: { scope } }),
+    api.post<{ changed: number }, { ids: number[] }>('/messages/purge', { ids }, { query: { scope } }),
 };
 
 // ---- 附件上传（先落 R2 草稿区，发送时引用 token）----
@@ -197,6 +238,11 @@ export const apiKeyApi = {
 
 // ---- 管理端 ----
 export const adminApi = {
+  searchUsers: (q: string, excludeUserId?: number, signal?: AbortSignal) =>
+    api.get<UserSearchResults>('/admin/users/search', { query: { q, excludeUserId }, signal }),
+  getMailbox: (id: number) => api.get<Mailbox>(`/admin/mailboxes/${id}`),
+  transferMailbox: (id: number, body: TransferMailboxRequest) =>
+    api.post<MailboxTransferResult, TransferMailboxRequest>(`/admin/mailboxes/${id}/transfer`, body),
   listUsers: () => api.get<AdminUser[]>('/admin/users'),
   createUser: (body: CreateUserRequest) => api.post<AdminUser, CreateUserRequest>('/admin/users', body),
   updateUser: (id: number, body: UpdateUserRequest) =>
@@ -207,9 +253,16 @@ export const adminApi = {
     api.put<Settings, UpdateSettingsRequest>('/admin/settings', body),
   domainStatus: (domain: string) =>
     api.get<DomainOnboardingStatus>('/admin/settings/domain-status', { query: { domain } }),
+  domainClaudeStats: () => api.get<DomainClaudeStats[]>('/admin/settings/domain-claude-stats'),
   listInvites: () => api.get<Invite[]>('/admin/invites'),
   createInvites: (body: CreateInviteRequest) => api.post<Invite[], CreateInviteRequest>('/admin/invites', body),
   revokeInvite: (id: number) => api.delete<void>(`/admin/invites/${id}`),
   auditLogs: (cursor?: string, limit = 30) =>
     api.get<Page<AdminAuditLogEntry>>('/admin/audit-logs', { query: { cursor, limit } }),
+  listMailboxShares: (mailboxId?: number) =>
+    api.get<MailboxShareGrant[]>('/admin/mailbox-shares', { query: { mailboxId } }),
+  replaceMailboxShares: (body: ReplaceMailboxSharesRequest) =>
+    api.put<MailboxShareGrant, ReplaceMailboxSharesRequest>('/admin/mailbox-shares', body),
+  revokeMailboxShare: (mailboxId: number, userId: number) =>
+    api.delete<{ success: boolean }>(`/admin/mailbox-shares/${mailboxId}/grantees/${userId}`),
 };

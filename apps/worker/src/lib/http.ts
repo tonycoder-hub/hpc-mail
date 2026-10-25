@@ -1,7 +1,7 @@
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { AppError } from './errors.js';
-import type { AppContext } from '../types.js';
+import type { AppContext, ExecCtx } from '../types.js';
 
 /** 结构化 schema 类型（zod safeParse 的鸭子类型，避免 worker 直接依赖 zod） */
 export interface SafeParser<T> {
@@ -17,6 +17,15 @@ export function ok<T>(c: Context<AppContext>, data: T, status: ContentfulStatusC
   return c.json({ data }, status);
 }
 
+/** Hono 在没有 ExecutionContext 时访问 executionCtx 会抛错；单测等场景返回 null */
+export function execCtx(c: Context<AppContext>): ExecCtx | null {
+  try {
+    return c.executionCtx;
+  } catch {
+    return null;
+  }
+}
+
 /** 取客户端 IP（部署在 Cloudflare 后，仅信任 CF-Connecting-IP） */
 export function clientIp(c: Context<AppContext>): string {
   const value = c.req.header('CF-Connecting-IP') || '';
@@ -28,6 +37,13 @@ export function parseId(value: string | undefined): number {
   const id = Number(value);
   if (!Number.isInteger(id) || id <= 0) throw new AppError('not_found', '资源不存在');
   return id;
+}
+
+/** 显式布尔查询不能因拼写或客户端类型差异静默退回 false。 */
+export function parseBooleanFlag(value: string | undefined): boolean {
+  if (value === undefined || value === '' || value === '0' || value === 'false') return false;
+  if (value === '1' || value === 'true') return true;
+  throw new AppError('validation_failed', '开关参数需为 1/0 或 true/false');
 }
 
 /** safeParse JSON body，失败抛 validation_failed */

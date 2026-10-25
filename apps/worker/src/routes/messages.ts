@@ -3,11 +3,14 @@ import {
   internalSendMailSchema,
   listMessagesQuerySchema,
   markReadRequestSchema,
+  markAllReadRequestSchema,
   starMessagesRequestSchema,
+  translateMessageRequestSchema,
+  type MessageListPage,
   type MessageSummary,
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
-import { ok, parseBody, parseId, parseQuery } from '../lib/http.js';
+import { execCtx, ok, parseBody, parseId, parseQuery } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
   countUnread,
@@ -22,35 +25,34 @@ import {
   purgeMessages,
   restoreMessages,
   starMessages,
+  syncMessages,
+  UNREAD_COUNT_CAP,
   type Viewer,
 } from '../services/message.js';
+import { messageViewer, mutationViewer } from '../lib/message-viewer.js';
 import { AppError } from '../lib/errors.js';
+import { pageHead } from '../lib/pagination.js';
 import { decodeInlineAttachments, sendMail } from '../services/outbound.js';
 import {
   beginIdempotentSend,
   completeIdempotentSend,
   failIdempotentSend,
 } from '../services/idempotency.js';
+import { translateMessage } from '../services/translate.js';
 import { consumeDraftAttachments, resolveDraftAttachments } from '../services/upload.js';
 import type { AppContext } from '../types.js';
 
 const app = new Hono<AppContext>();
 app.use('*', requireAuth);
 
-function parseListScope(raw: string | undefined): Viewer['scope'] {
-  return raw === 'mine' || raw === 'unclaimed' || raw === 'user' ? raw : undefined;
+function viewerOf(c: Context<AppContext>, bodyScope?: 'mine' | 'unclaimed'): Viewer {
+  const user = c.get('user')!;
+  return messageViewer(c, { userId: user.id, role: user.role }, bodyScope);
 }
 
-function viewerOf(c: Context<AppContext>): Viewer {
+function mutationViewerOf(c: Context<AppContext>, bodyScope?: 'mine' | 'unclaimed'): Viewer {
   const user = c.get('user')!;
-  const scope = parseListScope(c.req.query('scope'));
-  const userIdRaw = Number(c.req.query('userId'));
-  return {
-    userId: user.id,
-    role: user.role,
-    scope,
-    targetUserId: Number.isInteger(userIdRaw) && userIdRaw > 0 ? userIdRaw : undefined,
-  };
+  return mutationViewer(c, { userId: user.id, role: user.role }, bodyScope);
 }
 
 function viewerFromListQuery(
@@ -60,10 +62,17 @@ function viewerFromListQuery(
   return { userId: user.id, role: user.role, scope: query.scope, targetUserId: query.userId };
 }
 
+/**
+ * 首页（不带 cursor）附带 head，与 /sync 同一算法；带 afterId 的增量页不是 sync 所描述的首页，同样不带。
+ * /v1 列表不返回 head。
+ */
 app.get('/', async (c) => {
   const query = parseQuery(c, listMessagesQuerySchema);
   const user = c.get('user')!;
-  return ok(c, await listMessages(c.env, viewerFromListQuery(user, query), query));
+  const page = await listMessages(c.env, viewerFromListQuery(user, query), query);
+  if (query.cursor !== undefined || query.afterId !== undefined) return ok(c, page);
+  const body: MessageListPage = { ...page, head: await pageHead(page) };
+  return ok(c, body);
 });
 
 app.post('/send', async (c) => {
@@ -90,8 +99,10 @@ app.post('/send', async (c) => {
       req,
       attachments,
       origin,
+      idem.handle,
     );
-    await completeIdempotentSend(c.env, idem.handle, summary);
+    try { await completeIdempotentSend(c.env, idem.handle, summary); }
+    catch (error) { console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error); }
   } catch (error) {
     await failIdempotentSend(c.env, idem.handle, error);
     throw error;
@@ -110,46 +121,62 @@ app.post('/send', async (c) => {
 
 app.post('/read', async (c) => {
   const req = await parseBody(c, markReadRequestSchema);
-  const changed = await markMessages(c.env, viewerOf(c), req.ids, req.isRead);
+  const changed = await markMessages(c.env, mutationViewerOf(c, req.scope), req.ids, req.isRead);
   return ok(c, { changed });
 });
 
-/** 一键全读：可见范围内全部未读收件标为已读（admin 需显式 scope=unclaimed 才动未认领） */
+/**
+ * 一键全读：范围内全部未读收件标为已读，可按 domain/address/q 收窄；只动自己认领的地址，
+ * 共享邮件的已读状态属于所有者（admin 需显式 scope=unclaimed 才动未认领）
+ */
 app.post('/read-all', async (c) => {
-  const changed = await markAllRead(c.env, viewerOf(c));
+  const req = c.req.header('Content-Length') === '0' || c.req.raw.body === null
+    ? {} : await parseBody(c, markAllReadRequestSchema);
+  const { scope, ...filters } = req;
+  const changed = await markAllRead(c.env, mutationViewerOf(c, scope), filters);
   return ok(c, { changed });
 });
 
 app.post('/delete', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const deleted = await deleteMessages(c.env, viewerOf(c), req.ids);
+  const deleted = await deleteMessages(c.env, mutationViewerOf(c, req.scope), req.ids);
   return ok(c, { deleted });
 });
 
 /** 从回收站恢复 */
 app.post('/restore', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const restored = await restoreMessages(c.env, viewerOf(c), req.ids);
-  return ok(c, { restored });
+  const restored = await restoreMessages(c.env, mutationViewerOf(c, req.scope), req.ids);
+  return ok(c, { restored, changed: restored });
 });
 
 /** 永久删除（回收站里彻底删） */
 app.post('/purge', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, viewerOf(c), req.ids);
-  return ok(c, { purged });
+  const purged = await purgeMessages(c.env, mutationViewerOf(c, req.scope), req.ids, execCtx(c));
+  return ok(c, { purged, changed: purged });
 });
 
 app.post('/star', async (c) => {
   const req = await parseBody(c, starMessagesRequestSchema);
-  const changed = await starMessages(c.env, viewerOf(c), req.ids, req.starred);
+  const changed = await starMessages(c.env, mutationViewerOf(c, req.scope), req.ids, req.starred);
   return ok(c, { changed });
 });
 
-/** 侧栏收件箱未读角标：口径同 /inbox（scope=mine + inbound + 未读）。须在 /:id 之前注册 */
+/** 侧栏收件箱未读角标：口径同 /inbox（scope=mine + inbound + 未读），封顶 UNREAD_COUNT_CAP。须在 /:id 之前注册 */
 app.get('/unread-count', async (c) => {
   const user = c.get('user')!;
-  return ok(c, { unread: await countUnread(c.env, user.id, user.role) });
+  return ok(c, { unread: await countUnread(c.env, user.id, user.role, UNREAD_COUNT_CAP) });
+});
+
+/**
+ * 列表轻量轮询：参数与列表相同（同一 schema 与范围校验，cursor/afterId 忽略），
+ * 返回调用者未读数与该筛选首页的 head；head 与已加载首页不同才需要重拉列表
+ */
+app.get('/sync', async (c) => {
+  const query = parseQuery(c, listMessagesQuerySchema);
+  const user = c.get('user')!;
+  return ok(c, await syncMessages(c.env, viewerFromListQuery(user, query), query));
 });
 
 /** 写信收件人自动补全：近期联系人 */
@@ -161,6 +188,14 @@ app.get('/contacts', async (c) => {
 app.get('/:id/thread', async (c) => {
   const id = parseId(c.req.param('id'));
   return ok(c, { items: await getThread(c.env, viewerOf(c), id) });
+});
+
+/** AI 翻译为简体中文（仅 JWT，不开放到 /v1）：scope/userId 与详情同一校验，只译出自该邮件的片段 */
+app.post('/:id/translate', async (c) => {
+  const id = parseId(c.req.param('id'));
+  const viewer = viewerOf(c);
+  const req = await parseBody(c, translateMessageRequestSchema);
+  return ok(c, await translateMessage(c.env, execCtx(c), viewer, id, req.segments));
 });
 
 /** 下载原始 .eml（须在 /:id 之前注册） */

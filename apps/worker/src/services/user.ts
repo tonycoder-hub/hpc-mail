@@ -1,12 +1,13 @@
-import type { AdminUser, CreateUserRequest, UpdateUserRequest } from '@hpc-mail/shared';
-import { and, desc, eq, ne, sql } from 'drizzle-orm';
+import type { AdminUser, CreateUserRequest, SearchUsersQuery, UpdateUserRequest, UserSearchResults } from '@hpc-mail/shared';
+import { and, asc, desc, eq, ne, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { mailboxes, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import { hashPassword } from '../lib/password.js';
-import type { Env } from '../types.js';
+import type { Env, ExecCtx } from '../types.js';
 import { avatarUrl } from './avatar.js';
-import { bumpUserEpoch } from './session.js';
+import { mirrorUserEpoch } from './session.js';
+import { getSettingsFresh } from './setting.js';
 
 type UserRow = typeof users.$inferSelect;
 
@@ -44,6 +45,8 @@ function serialize(row: UserRow, mailboxAddresses: string[], apiKeyCount: number
     role: row.role,
     status: row.status,
     mailboxCount: mailboxAddresses.length,
+    mailboxPolicy: row.mailboxPolicy,
+    mailboxPolicyRevision: row.mailboxPolicyRevision,
     mailboxes: mailboxAddresses,
     apiKeyCount,
     createdAt: row.createdAt.toISOString(),
@@ -83,6 +86,19 @@ export async function listUsers(env: Env): Promise<AdminUser[]> {
   return rows.map((r) => serialize(r.user, byUser.get(r.user.id) ?? [], Number(r.apiKeyCount)));
 }
 
+/** 过户和共享候选搜索：只读必要字段，限制结果数，不扫描/返回用户的全部邮箱及 Key 统计。 */
+export async function searchUsers(env: Env, req: SearchUsersQuery): Promise<UserSearchResults> {
+  const rows = await createDb(env).select({ id: users.id, username: users.username, role: users.role })
+    .from(users)
+    .where(and(eq(users.status, 'active'),
+      sql`instr(lower(${users.username}), ${req.q}) > 0`,
+      req.excludeUserId === undefined ? undefined : ne(users.id, req.excludeUserId)))
+    .orderBy(sql`CASE WHEN lower(${users.username}) = ${req.q} THEN 0
+      WHEN substr(lower(${users.username}), 1, ${req.q.length}) = ${req.q} THEN 1 ELSE 2 END`, asc(users.username))
+    .limit(req.limit + 1).all();
+  return { items: rows.slice(0, req.limit), hasMore: rows.length > req.limit };
+}
+
 export async function createUser(env: Env, req: CreateUserRequest): Promise<AdminUser> {
   const db = createDb(env);
   const existing = await db.select().from(users).where(eq(users.username, req.username)).get();
@@ -100,6 +116,7 @@ export async function updateUser(
   actingUserId: number,
   id: number,
   req: UpdateUserRequest,
+  ctx?: ExecCtx | null,
 ): Promise<AdminUser> {
   const db = createDb(env);
   const target = await db.select().from(users).where(eq(users.id, id)).get();
@@ -107,6 +124,21 @@ export async function updateUser(
 
   const patch: Partial<UserRow> = {};
   let bumpEpoch = false;
+  let domainsRevision: number | undefined;
+  if (req.mailboxPolicy !== undefined) {
+    if (req.expectedMailboxPolicyRevision !== target.mailboxPolicyRevision) {
+      throw new AppError('conflict', '邮箱权限已被其他请求修改，请刷新后重试');
+    }
+    if (req.mailboxPolicy !== null) {
+      const settings = await getSettingsFresh(env);
+      const configured = new Set(settings.domains.list.map(({ domain }) => domain));
+      if (req.mailboxPolicy.domains.some(({ domain }) => !configured.has(domain))) {
+        throw new AppError('validation_failed', '只能授权已配置的系统域名');
+      }
+      domainsRevision = settings.domains.revision ?? 0;
+    }
+    patch.mailboxPolicy = req.mailboxPolicy;
+  }
 
   if (req.status !== undefined) {
     if (req.status === 'disabled' && id === actingUserId) {
@@ -133,14 +165,21 @@ export async function updateUser(
 
   let row: UserRow | undefined;
   try {
-    [row] = await db.update(users).set(patch).where(eq(users.id, id)).returning();
+    [row] = await db.update(users).set({ ...patch,
+      ...(req.mailboxPolicy !== undefined || req.role !== undefined ? { mailboxPolicyRevision: sql`${users.mailboxPolicyRevision} + 1` } : {}),
+      ...(bumpEpoch ? { authVersion: sql`${users.authVersion} + 1`, authVersionMigrated: true } : {}),
+    }).where(and(eq(users.id, id),
+      req.mailboxPolicy === undefined ? undefined : eq(users.mailboxPolicyRevision, req.expectedMailboxPolicyRevision!),
+      domainsRevision === undefined ? undefined : sql`COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) = ${domainsRevision}`,
+    )).returning();
   } catch (error) {
     if (isLastAdminConstraint(error)) {
       throw new AppError('forbidden', '至少保留一个可用管理员，无法执行此操作');
     }
     throw error;
   }
-  if (bumpEpoch) await bumpUserEpoch(env, id);
+  if (!row) throw new AppError('conflict', '用户或域名配置已改变，请刷新后重试');
+  if (bumpEpoch && row) await mirrorUserEpoch(env, id, row.authVersion, ctx);
 
   const count = await db
     .select({ apiKeyCount: apiKeyCountSql })
@@ -151,10 +190,10 @@ export async function updateUser(
 }
 
 /**
- * 删除用户：级联清理 mailboxes / api_keys / stars / 头像 R2 对象，避免僵尸数据。
+ * 删除用户：级联清理 mailboxes / mailbox_shares / api_keys / stars / 头像 R2 对象，避免僵尸数据。
  * messages 不动（仍按 address 归属，随地址回未认领态）。
  */
-export async function deleteUser(env: Env, actingUserId: number, id: number): Promise<void> {
+export async function deleteUser(env: Env, actingUserId: number, id: number, ctx?: ExecCtx | null): Promise<void> {
   if (id === actingUserId) throw new AppError('forbidden', '不能删除自己');
   const db = createDb(env);
   const target = await db
@@ -164,10 +203,21 @@ export async function deleteUser(env: Env, actingUserId: number, id: number): Pr
     .get();
   if (!target) throw new AppError('not_found', '用户不存在');
   if (target.role === 'admin') await assertNotLastAdmin(db, id);
+  // 托管域名不能没有所有者：先过户或删除
+  const hosted = await env.db.prepare("SELECT domain FROM hosted_domains WHERE user_id = ? AND status <> 'deleting' LIMIT 5")
+    .bind(id).all<{ domain: string }>();
+  if (hosted.results.length) {
+    throw new AppError('conflict', `该用户还拥有托管域名 ${hosted.results.map((row) => row.domain).join('、')}，请先过户或删除`);
+  }
 
   // D1 batch 作为一个事务提交：最后管理员触发器若拒绝 DELETE，前面的关联清理也会整体回滚。
   try {
     await env.db.batch([
+      env.db.prepare('DELETE FROM hosted_domain_members WHERE user_id = ?').bind(id),
+      env.db.prepare('DELETE FROM mailbox_shares WHERE user_id = ?').bind(id),
+      env.db
+        .prepare('DELETE FROM mailbox_shares WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE user_id = ?)')
+        .bind(id),
       env.db.prepare('DELETE FROM mailboxes WHERE user_id = ?').bind(id),
       env.db.prepare('DELETE FROM api_keys WHERE user_id = ?').bind(id),
       env.db.prepare('DELETE FROM stars WHERE user_id = ?').bind(id),
@@ -180,11 +230,12 @@ export async function deleteUser(env: Env, actingUserId: number, id: number): Pr
     throw error;
   }
   if (target.avatarKey) {
-    try {
-      await env.r2.delete(target.avatarKey);
-    } catch (e) {
+    // 头像对象尽力删除：有 ctx 时放进 waitUntil，不阻塞响应
+    const removal = env.r2.delete(target.avatarKey).catch((e: unknown) => {
       console.error('删除用户头像对象失败:', e);
-    }
+    });
+    if (ctx) ctx.waitUntil(removal);
+    else await removal;
   }
   // 用户行已删除，鉴权中间件会立即拒绝旧 token；KV 兼容版本不再需要额外 bump。
 }

@@ -16,6 +16,13 @@ DROP TABLE IF EXISTS role;
 DROP TABLE IF EXISTS setting;
 DROP TABLE IF EXISTS schema_meta;
 -- 新系统表（幂等重跑保护）
+DROP TABLE IF EXISTS hosted_domain_members;
+DROP TABLE IF EXISTS hosted_domains;
+DROP TABLE IF EXISTS claude_address_facts;
+DROP TABLE IF EXISTS delivery_object_leases;
+DROP TABLE IF EXISTS notification_jobs;
+DROP TABLE IF EXISTS storage_cleanup_jobs;
+DROP TABLE IF EXISTS external_attachment_links;
 DROP TABLE IF EXISTS api_rate_limits;
 DROP TABLE IF EXISTS api_request_logs;
 DROP TABLE IF EXISTS api_keys;
@@ -26,9 +33,11 @@ DROP TABLE IF EXISTS admin_audit_logs;
 DROP TABLE IF EXISTS rate_counters;
 DROP TABLE IF EXISTS idempotency_records;
 DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS message_translations;
 DROP TABLE IF EXISTS stars;
 DROP TABLE IF EXISTS attachments;
 DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS mailbox_shares;
 DROP TABLE IF EXISTS mailboxes;
 DROP TABLE IF EXISTS users;
 -- 迁移 journal（清掉后 migrations apply 会从 0 重放）

@@ -3,12 +3,14 @@ import {
   feishuSettingSchema,
   gmailForwardSettingSchema,
   notifyWebhookSettingSchema,
+  pushdeerSettingSchema,
 } from './admin-settings.js';
 
-/** 个人飞书 / 通用 webhook / 邮箱转发 的配置形状（与旧全局设置同形，复用校验） */
+/** 个人飞书 / 通用 webhook / 邮箱转发 / PushDeer 的配置形状（复用校验） */
 export type FeishuConfig = z.infer<typeof feishuSettingSchema>;
 export type WebhookConfig = z.infer<typeof notifyWebhookSettingSchema>;
 export type ForwardConfig = z.infer<typeof gmailForwardSettingSchema>;
+export type PushDeerConfig = z.infer<typeof pushdeerSettingSchema>;
 
 /**
  * 每用户的转发与通知偏好。语义：
@@ -21,6 +23,7 @@ export const userNotifyPrefsSchema = z.object({
   feishu: feishuSettingSchema,
   webhook: notifyWebhookSettingSchema,
   forward: gmailForwardSettingSchema,
+  pushdeer: pushdeerSettingSchema.default({ enabled: false, endpoint: '', pushkey: '' }),
 });
 export type UserNotifyPrefs = z.infer<typeof userNotifyPrefsSchema>;
 
@@ -28,16 +31,32 @@ export const DEFAULT_USER_NOTIFY_PREFS: UserNotifyPrefs = {
   feishu: { enabled: false, webhookUrl: '', secret: '', contentLevel: 'summary' },
   webhook: { enabled: false, url: '', secret: '' },
   forward: { enabled: false, addresses: [] },
+  pushdeer: { enabled: false, endpoint: '', pushkey: '' },
 };
 
-/** 更新请求：三块各自可选，至少一块 */
+/** 更新请求：各项各自可选，至少一项 */
 export const updateNotifyPrefsRequestSchema = z
   .object({
     feishu: feishuSettingSchema.optional(),
     webhook: notifyWebhookSettingSchema.optional(),
     forward: gmailForwardSettingSchema.optional(),
+    pushdeer: pushdeerSettingSchema.optional(),
   })
   .refine((v) => Object.values(v).some((x) => x !== undefined), {
     message: '至少提供一个待更新项',
   });
 export type UpdateNotifyPrefsRequest = z.infer<typeof updateNotifyPrefsRequestSchema>;
+
+export interface NotificationDeliveryView {
+  id: number; messageId: number | null; target: string; status: 'pending' | 'processing' | 'succeeded' | 'failed' | 'skipped' | 'unknown';
+  attempts: number; maxAttempts: number; lastError: string; lastHttpStatus: number | null;
+  createdAt: string; updatedAt: string; nextAttemptAt: string; lastAttemptAt: string | null;
+}
+export interface NotificationHealth {
+  channels: Array<{ channel: 'feishu' | 'pushdeer' | 'webhook' | 'forward'; enabled: boolean; latest: NotificationDeliveryView | null; pendingCount: number; failedCount: number }>;
+  forward: {
+    domainLimit: number; targetLimit: number; windowEndsAt: string;
+    targets: Array<{ address: string; attempts: number; remaining: number }>;
+    domains: Array<{ domain: string; attempts: number; remaining: number }>;
+  };
+}

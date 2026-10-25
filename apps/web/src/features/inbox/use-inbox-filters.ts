@@ -1,14 +1,21 @@
 import { useCallback, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { type InboxFilters, parseInboxFilters } from './inbox-query';
 
-export interface InboxFilters {
-  domain: string | null;
-  address: string | null;
-  unread: boolean;
-  q: string;
+export type { InboxFilters } from './inbox-query';
+
+let rememberedAddress: string | null = null;
+
+/** 收件箱当前筛选的地址：写信页在没有上次发件身份时据此预选发件地址 */
+export function rememberFilterAddress(address: string | null): void {
+  rememberedAddress = address;
 }
 
-function domainOf(address: string | null): string | null {
+export function rememberedFilterAddress(): string | null {
+  return rememberedAddress;
+}
+
+export function domainOf(address: string | null): string | null {
   if (!address) return null;
   const at = address.lastIndexOf('@');
   return at >= 0 ? address.slice(at + 1) : null;
@@ -21,15 +28,7 @@ function domainOf(address: string | null): string | null {
 export function useInboxFilters() {
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const filters = useMemo<InboxFilters>(
-    () => ({
-      domain: searchParams.get('domain') || null,
-      address: searchParams.get('address') || null,
-      unread: searchParams.get('unread') === '1',
-      q: searchParams.get('q') ?? '',
-    }),
-    [searchParams],
-  );
+  const filters = useMemo<InboxFilters>(() => parseInboxFilters(searchParams), [searchParams]);
 
   const mutate = useCallback(
     (mutator: (params: URLSearchParams) => void) => {
@@ -92,6 +91,15 @@ export function useInboxFilters() {
     [mutate],
   );
 
+  /** 清除域名/地址/未读，保留搜索词（移动端筛选面板用） */
+  const clearFacets = useCallback(() => {
+    mutate((params) => {
+      params.delete('domain');
+      params.delete('address');
+      params.delete('unread');
+    });
+  }, [mutate]);
+
   const reset = useCallback(() => {
     mutate((params) => {
       params.delete('domain');
@@ -101,5 +109,5 @@ export function useInboxFilters() {
     });
   }, [mutate]);
 
-  return { filters, setDomain, setAddress, setUnread, setQuery, reset };
+  return { filters, setDomain, setAddress, setUnread, setQuery, clearFacets, reset };
 }

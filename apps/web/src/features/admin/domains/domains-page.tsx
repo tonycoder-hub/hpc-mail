@@ -3,18 +3,20 @@ import {
   AlertTriangle,
   ArrowDown,
   CheckCircle2,
+  ChevronDown,
   ExternalLink,
   Globe,
   Plus,
   RefreshCw,
   Trash2,
 } from 'lucide-react';
-import { type FormEvent, type ReactNode, useState } from 'react';
-import { type DomainEntry, type DomainOnboardingStatus, domainSchema } from '@hpc-mail/shared';
+import { type FormEvent, type ReactNode, useEffect, useState } from 'react';
+import { type DomainClaudeStats, type DomainEntry, type DomainOnboardingStatus, domainSchema } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
+import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -27,6 +29,7 @@ import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 import { toast } from '@/components/ui/toast';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
+import { cn } from '@/lib/cn';
 
 const WORKER_NAME = 'hpc-cloud-mail';
 const CLOUDFLARE_DASH = 'https://dash.cloudflare.com';
@@ -75,7 +78,7 @@ function StatusBadge({
     return (
       <Badge tone="positive">
         <CheckCircle2 className="size-3" />
-        已接入
+        MX 已就绪
       </Badge>
     );
   }
@@ -87,31 +90,54 @@ function StatusBadge({
   );
 }
 
+/** 该域名的 Claude 账号与封号统计；全为 0 时只给一句说明 */
+function ClaudeStatsLine({ stats }: { stats: DomainClaudeStats | undefined }) {
+  if (!stats) return null;
+  const empty = stats.accounts === 0 && stats.pending === 0 && stats.recent === 0;
+  return (
+    <p className="text-xs text-ink-tertiary">
+      Claude：
+      {empty
+        ? '暂无记录'
+        : `账号 ${stats.accounts} · 封 ${stats.suspended} · 付费 ${stats.paid} · 付费封 ${stats.paidSuspended} · 未注册 ${stats.pending} · 24 小时新增 ${stats.recent}`}
+    </p>
+  );
+}
+
 interface DomainRowProps {
   entry: DomainEntry;
   status: DomainOnboardingStatus | undefined;
+  stats: DomainClaudeStats | undefined;
+  /** claim_random.dailyLimit；0 表示不限 */
+  dailyLimit: number;
   isFetching: boolean;
   busy: boolean;
   onTogglePublic: (domain: string, next: boolean) => void;
+  onToggleRandom: (domain: string, next: boolean) => void;
   onSetLimit: (domain: string, next: number) => void;
   onRefetch: () => void;
   onRemove: (domain: string) => void;
 }
 
-/** 单个域名行：接入状态 + 公开开关 + 按域名认领上限。上限输入本地暂存，失焦提交。 */
+/** 单个域名行：接入状态 + 公开开关 + 按域名认领上限 + 是否参与随机。上限输入本地暂存，失焦提交。 */
 function DomainRow({
   entry,
   status,
+  stats,
+  dailyLimit,
   isFetching,
   busy,
   onTogglePublic,
+  onToggleRandom,
   onSetLimit,
   onRefetch,
   onRemove,
 }: DomainRowProps) {
   const [limitDraft, setLimitDraft] = useState(String(entry.perUserLimit));
+  useEffect(() => setLimitDraft(String(entry.perUserLimit)), [entry.perUserLimit]);
 
   const commitLimit = () => {
+    if (busy) return;
     const parsed = Number.parseInt(limitDraft, 10);
     const next = Number.isNaN(parsed) ? entry.perUserLimit : Math.min(Math.max(parsed, 0), 10000);
     setLimitDraft(String(next));
@@ -129,15 +155,24 @@ function DomainRow({
     <li className="flex flex-col gap-2.5 rounded-md border border-line px-3 py-2.5">
       <div className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="truncate font-mono text-sm text-ink">{entry.domain}</span>
+          <span className="truncate text-sm font-medium text-ink">{entry.domain}</span>
           <StatusBadge isFetching={isFetching} status={status} />
           {entry.public && <Badge tone="accent">公开</Badge>}
+          {entry.random === false && <Badge>不参与随机</Badge>}
+          {stats && (stats.suspended > 0 || stats.risk !== null) && (
+            <Badge tone="critical" title="该域名有历史 Claude 封号记录，Claude 0 封号模式禁止认领">
+              有封号记录，已排除
+            </Badge>
+          )}
+          {stats && stats.suspended === 0 && stats.risk === null && entry.random !== false && dailyLimit > 0 && stats.recent >= dailyLimit && (
+            <Badge tone="caution" title="近 24 小时新增已达每日上限，Claude 0 封号模式暂不分配这个后缀">今日新增已满</Badge>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           <IconButton size="sm" aria-label={`重新检测 ${entry.domain}`} disabled={isFetching} onClick={onRefetch}>
             <RefreshCw className={`size-4 text-ink-tertiary ${isFetching ? 'animate-spin' : ''}`} />
           </IconButton>
-          <IconButton size="sm" aria-label={`移除 ${entry.domain}`} onClick={() => onRemove(entry.domain)}>
+          <IconButton size="sm" aria-label={`移除 ${entry.domain}`} disabled={busy} onClick={() => onRemove(entry.domain)}>
             <Trash2 className="size-4 text-critical" />
           </IconButton>
         </div>
@@ -145,7 +180,7 @@ function DomainRow({
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-[13px]">
         <label className="flex cursor-pointer items-center gap-2 text-ink-secondary">
-          <Switch checked={entry.public} disabled={busy} onCheckedChange={(v) => onTogglePublic(entry.domain, v)} />
+          <Switch aria-label={`${entry.domain} 公开给普通用户`} checked={entry.public} disabled={busy} onCheckedChange={(v) => onTogglePublic(entry.domain, v)} />
           <span>{entry.public ? '公开给普通用户' : '仅管理员可用'}</span>
         </label>
         <span className="text-xs text-ink-tertiary">关掉后不能再被新认领，已认领的人仍可收发</span>
@@ -166,7 +201,13 @@ function DomainRow({
             <span className="text-ink-tertiary">个（0=不限）</span>
           </div>
         )}
+        <label className="flex cursor-pointer items-center gap-2 text-ink-secondary">
+          <Switch aria-label={`${entry.domain} 参与随机生成`} checked={entry.random !== false} disabled={busy} onCheckedChange={(v) => onToggleRandom(entry.domain, v)} />
+          <span>{entry.random !== false ? '参与随机生成' : '不参与随机生成'}</span>
+        </label>
       </div>
+
+      <ClaudeStatsLine stats={stats} />
 
       {detail && <p className="text-xs text-ink-tertiary">{detail}</p>}
     </li>
@@ -175,7 +216,7 @@ function DomainRow({
 
 export function DomainsPage() {
   const queryClient = useQueryClient();
-  const { data: settings, isLoading } = useQuery({
+  const { data: settings, isLoading, isError, error: settingsError, refetch } = useQuery({
     queryKey: queryKeys.admin.settings,
     queryFn: () => adminApi.getSettings(),
   });
@@ -184,6 +225,8 @@ export function DomainsPage() {
   const [newDomain, setNewDomain] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
+  // 接入指南：还没有域名时默认展开，已有域名时默认折叠；用户手动切换后以手动为准
+  const [guideToggled, setGuideToggled] = useState<boolean | null>(null);
 
   const list = settings?.domains.list ?? [];
   const affected = removing ? (allMailboxes ?? []).filter((box) => box.domain === removing) : [];
@@ -198,25 +241,47 @@ export function DomainsPage() {
     })),
   });
 
+  // Claude 统计只用于展示与参考，查询失败不影响域名管理
+  const statsQuery = useQuery({
+    queryKey: queryKeys.admin.domainClaudeStats,
+    queryFn: () => adminApi.domainClaudeStats(),
+    staleTime: 60_000,
+    retry: false,
+  });
+  const statsByDomain = new Map((statsQuery.data ?? []).map((item) => [item.domain, item]));
+
   const persist = useMutation({
-    mutationFn: (nextList: DomainEntry[]) => adminApi.updateSettings({ domains: { list: nextList } }),
+    mutationFn: (nextList: DomainEntry[]) => {
+      if (!settings || isError) throw new Error('请先加载完整域名配置');
+      return adminApi.updateSettings({ domains: { list: nextList }, expectedDomainsRevision: settings.domains.revision ?? 0 });
+    },
     onSuccess: (saved) => {
       queryClient.setQueryData(queryKeys.admin.settings, saved);
       // 可见性/公开域名变化会影响公开配置与「可见域名」两处
       void queryClient.invalidateQueries({ queryKey: queryKeys.config });
       void queryClient.invalidateQueries({ queryKey: queryKeys.domains });
     },
-    onError: (err) =>
-      toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' }),
+    onError: (err) => {
+      if (err instanceof ApiError && err.httpStatus === 409) {
+        void refetch();
+        toast({ title: '域名配置已被其他操作更新，正在重新加载，请重试', variant: 'error' });
+        return;
+      }
+      toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' });
+    },
   });
+  const guideOpen = guideToggled ?? (!isLoading && list.length === 0);
+  const canEdit = settings !== undefined && !isLoading && !isError && !persist.isPending;
 
   /** 局部更新某域名条目并落库 */
   const updateEntry = (domain: string, patch: Partial<DomainEntry>) => {
+    if (!canEdit) return;
     persist.mutate(list.map((e) => (e.domain === domain ? { ...e, ...patch } : e)));
   };
 
   const addDomain = (event: FormEvent) => {
     event.preventDefault();
+    if (!canEdit) return;
     const value = newDomain.trim().toLowerCase();
     const parsed = domainSchema.safeParse(value);
     if (!parsed.success) {
@@ -228,7 +293,7 @@ export function DomainsPage() {
       return;
     }
     // 新域名默认「仅管理员」，需管理员显式打开公开开关
-    persist.mutate([...list, { domain: parsed.data, public: false, perUserLimit: 0 }], {
+    persist.mutate([...list, { domain: parsed.data, public: false, perUserLimit: 0, random: true }], {
       onSuccess: () => {
         toast({ title: '域名已添加（默认仅管理员可用）', variant: 'success' });
         setNewDomain('');
@@ -238,7 +303,7 @@ export function DomainsPage() {
   };
 
   const confirmRemove = () => {
-    if (!removing) return;
+    if (!removing || !canEdit) return;
     persist.mutate(
       list.filter((e) => e.domain !== removing),
       {
@@ -258,62 +323,81 @@ export function DomainsPage() {
       />
 
       {/* 接入向导 */}
-      <section className="flex flex-col gap-4 rounded-lg border border-line bg-surface p-5">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">如何接入一个新域名</h2>
-          <p className="mt-0.5 text-[13px] text-ink-secondary">
-            步骤 ①② 在 Cloudflare 后台完成（本站无法代办），步骤 ③ 在本页下方完成。
-          </p>
-        </div>
+      <section className="rounded-lg border border-line bg-surface">
+        <h2 className="text-sm font-semibold text-ink">
+          <button
+            type="button"
+            aria-expanded={guideOpen}
+            aria-controls="domain-onboarding-guide"
+            onClick={() => setGuideToggled(!guideOpen)}
+            className="flex w-full items-start justify-between gap-3 rounded-lg px-5 py-4 text-left transition-colors hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+          >
+            <span className="flex flex-col gap-0.5">
+              <span>如何接入一个新域名</span>
+              <span className="text-[13px] font-normal text-ink-secondary">
+                步骤 ①② 在 Cloudflare 后台完成（本站无法代办），步骤 ③ 在本页下方完成。
+              </span>
+            </span>
+            <ChevronDown
+              aria-hidden
+              className={cn('mt-0.5 size-4 shrink-0 text-ink-tertiary transition-transform', guideOpen && 'rotate-180')}
+            />
+          </button>
+        </h2>
 
-        <ol className="flex flex-col gap-5">
-          <GuideStep n={1} title="在 Cloudflare 为该域开启 Email Routing">
-            <p>
-              进入目标域名所在的 Cloudflare 账户 → 选择该域名 → 左侧菜单 <b>Email</b> →{' '}
-              <b>Email Routing</b> → 点击开启。Cloudflare 会自动为该域写入所需的 MX 与 SPF 记录（无需手动配）。
-            </p>
-            <div>
-              <Button asChild variant="secondary" size="sm">
-                <a href={CLOUDFLARE_DASH} target="_blank" rel="noreferrer">
-                  打开 Cloudflare 控制台
-                  <ExternalLink className="size-3.5" />
-                </a>
-              </Button>
-            </div>
-          </GuideStep>
+        {guideOpen && (
+          <div id="domain-onboarding-guide" className="border-t border-line px-5 pb-5 pt-4">
+            <ol className="flex flex-col gap-5">
+              <GuideStep n={1} title="在 Cloudflare 为该域开启 Email Routing">
+                <p>
+                  进入目标域名所在的 Cloudflare 账户 → 选择该域名 → 左侧菜单 <b>Email</b> →{' '}
+                  <b>Email Routing</b> → 点击开启。Cloudflare 会自动为该域写入所需的 MX 与 SPF 记录（无需手动配）。
+                </p>
+                <div>
+                  <Button asChild variant="secondary" size="sm">
+                    <a href={CLOUDFLARE_DASH} target="_blank" rel="noreferrer">
+                      打开 Cloudflare 控制台
+                      <ExternalLink className="size-3.5" />
+                    </a>
+                  </Button>
+                </div>
+              </GuideStep>
 
-          <GuideStep n={2} title="创建 Catch-all 规则，指向本系统 Worker">
-            <p>
-              在 Email Routing → <b>Routing rules</b> → <b>Catch-all address</b> → 编辑 → 动作选{' '}
-              <b>Send to a Worker</b> → 选择下面这个 Worker。这一步让任意前缀（如 <span className="font-mono">abc@你的域</span>）的邮件全部进入本系统。
-            </p>
-            <div className="flex items-center gap-2">
-              <code className="rounded-sm bg-surface-active px-2 py-1 font-mono text-xs text-ink">
-                {WORKER_NAME}
-              </code>
-              <CopyButton value={WORKER_NAME} label="复制 Worker 名" size="sm" />
-            </div>
-            <p className="text-ink-tertiary">
-              ⚠️ Catch-all 动作必须选「Send to a Worker」，不要选「转发到某邮箱」，否则邮件不会进入本系统。
-            </p>
-          </GuideStep>
+              <GuideStep n={2} title="创建 Catch-all 规则，指向本系统 Worker">
+                <p>
+                  在 Email Routing → <b>Routing rules</b> → <b>Catch-all address</b> → 编辑 → 动作选{' '}
+                  <b>Send to a Worker</b> → 选择下面这个 Worker。这一步让任意前缀（如 abc@你的域）的邮件全部进入本系统。
+                </p>
+                <div className="flex items-center gap-2">
+                  <code className="rounded-sm bg-surface-active px-2 py-1 font-mono text-xs text-ink">
+                    {WORKER_NAME}
+                  </code>
+                  <CopyButton value={WORKER_NAME} label="复制 Worker 名" size="sm" />
+                </div>
+                <p className="flex items-start gap-1.5 text-ink-tertiary">
+                  <AlertTriangle aria-hidden className="mt-[3px] size-3.5 shrink-0 text-caution" />
+                  <span>Catch-all 动作必须选「Send to a Worker」，不要选「转发到某邮箱」，否则邮件不会进入本系统。</span>
+                </p>
+              </GuideStep>
 
-          <GuideStep n={3} title="在本页下方把域名添加进系统并按需公开">
-            <p className="flex flex-wrap items-center gap-1.5">
-              添加后默认<b>仅管理员可用</b>；打开该域名的「公开」开关后普通用户才可见、可认领，并可设每人认领上限。
-              <ArrowDown className="size-3.5 text-ink-tertiary" />
-            </p>
-          </GuideStep>
+              <GuideStep n={3} title="在本页下方把域名添加进系统并按需公开">
+                <p>
+                  添加后默认<b>仅管理员可用</b>；打开该域名的「公开」开关后普通用户才可见、可认领，并可设每人认领上限。
+                  <ArrowDown aria-hidden className="ml-1 inline size-3.5 align-[-2px] text-ink-tertiary" />
+                </p>
+              </GuideStep>
 
-          <GuideStep n={4} title="（可选）把常用外部邮箱加为已验证目标">
-            <p>
-              对外发信与转发默认即可送达任意外部邮箱。若额外在 Email Routing →{' '}
-              <b>Destination addresses</b> 验证目标邮箱，邮箱转发将走 Cloudflare 原生通道、
-              原样保留邮件头与签名（保真度更高）。
-            </p>
-            <p className="text-ink-tertiary">站内地址之间互发直接落库、即时送达。</p>
-          </GuideStep>
-        </ol>
+              <GuideStep n={4} title="（可选）把常用外部邮箱加为已验证目标">
+                <p>
+                  对外发信与转发默认即可送达任意外部邮箱。若额外在 Email Routing →{' '}
+                  <b>Destination addresses</b> 验证目标邮箱，邮箱转发将走 Cloudflare 原生通道、
+                  原样保留邮件头与签名（保真度更高）。
+                </p>
+                <p className="text-ink-tertiary">站内地址之间互发直接落库、即时送达。</p>
+              </GuideStep>
+            </ol>
+          </div>
+        )}
       </section>
 
       {/* 本站域名列表 */}
@@ -321,14 +405,22 @@ export function DomainsPage() {
         <div>
           <h2 className="text-sm font-semibold text-ink">本站域名</h2>
           <p className="mt-0.5 text-[13px] text-ink-secondary">
-            系统会自动检测每个域名的收件链路（MX 是否已指向 Cloudflare）。
+            系统只检测 MX 是否已指向 Cloudflare；请另外确认 Catch-all 指向本 Worker，并发送测试邮件验证完整链路。
             <b>公开</b>开关决定普通用户是否可见并认领该域名；<b>每人可认领</b>限制普通用户在该域名下的地址数（管理员不受限）。
+            <b>参与随机生成</b>关掉后，认领时的「均匀随机」和「Claude 0 封号」都不会分配这个域名，仍可手动选择；Claude 0 封号模式下，有历史封号记录的域名始终禁止认领。
+          </p>
+          <p className="mt-1 text-xs text-ink-tertiary">
+            Claude 统计根据历史官方来信判定，可能有约 5 分钟延迟；任意历史封号记录都会禁止该域名在 Claude 0 封号模式下认领，不受付费状态或封号比例影响。0 封号不保证未来不会封号；每日新增上限见「系统设置 · 随机认领规则」。
+            {statsQuery.isError && ' Claude 统计暂时加载失败。'}
           </p>
         </div>
 
         <form onSubmit={addDomain} className="flex items-start gap-2">
           <div className="flex-1">
             <Input
+              aria-label="新增收件域名"
+              aria-describedby={error ? 'new-domain-error' : undefined}
+              disabled={!canEdit}
               placeholder="example.com"
               value={newDomain}
               invalid={error !== null}
@@ -337,9 +429,9 @@ export function DomainsPage() {
                 if (error) setError(null);
               }}
             />
-            {error && <p className="mt-1 text-xs text-critical">{error}</p>}
+            {error && <p id="new-domain-error" role="alert" className="mt-1 text-xs text-critical">{error}</p>}
           </div>
-          <Button type="submit" variant="secondary" loading={persist.isPending}>
+          <Button type="submit" variant="secondary" loading={persist.isPending} disabled={!canEdit}>
             <Plus className="size-4" />
             添加
           </Button>
@@ -347,6 +439,8 @@ export function DomainsPage() {
 
         {isLoading ? (
           <Skeleton className="h-24 w-full rounded-md" />
+        ) : isError ? (
+          <QueryErrorState error={settingsError} onRetry={() => void refetch()} />
         ) : list.length > 0 ? (
           <ul className="flex flex-col gap-2">
             {list.map((entry, i) => {
@@ -356,9 +450,12 @@ export function DomainsPage() {
                   key={entry.domain}
                   entry={entry}
                   status={q?.data}
+                  stats={statsByDomain.get(entry.domain)}
+                  dailyLimit={settings?.claim_random?.dailyLimit ?? 0}
                   isFetching={q?.isFetching ?? false}
-                  busy={persist.isPending}
+                  busy={!canEdit}
                   onTogglePublic={(domain, next) => updateEntry(domain, { public: next })}
+                  onToggleRandom={(domain, next) => updateEntry(domain, { random: next })}
                   onSetLimit={(domain, next) => updateEntry(domain, { perUserLimit: next })}
                   onRefetch={() => q?.refetch()}
                   onRemove={setRemoving}
@@ -382,9 +479,9 @@ export function DomainsPage() {
         title="移除这个域名？"
         description={
           removing
-            ? `移除 ${removing} 后，该域名将不再用于地址认领、发件白名单与前端展示。${
+            ? `移除 ${removing} 后将停止新的地址认领。已有邮箱和历史邮件保留，已有邮箱仍可收发；关闭收件还需在 Cloudflare 停用 Catch-all。${
                 affected.length > 0
-                  ? `当前该域下有 ${affected.length} 个已认领地址，移除后这些用户将无法用该域发件（历史邮件仍保留、仍可收信直到 Cloudflare 侧关闭 catch-all）。`
+                  ? `当前已加载 ${affected.length} 个该域的认领地址。`
                   : '（当前该域下暂无已认领地址。）'
               }`
             : undefined

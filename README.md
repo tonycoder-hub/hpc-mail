@@ -35,7 +35,7 @@
 
 ## HPC Mail 是什么
 
-HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Routing（收件）+ Workers（处理）+ D1 / KV / R2（存储）+ Workers AI（验证码兜底）** 组合出完整的多域名、多用户邮件服务——没有 SMTP 服务器要维护，没有 VPS 要续费，日常用量基本落在 Cloudflare 免费额度内。
+HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Routing（收件）+ Workers（处理）+ D1 / KV / R2（存储）** 组合出，可选接入一个 OpenAI 兼容大模型（如 DeepSeek）做验证码兜底识别与邮件翻译，完整的多域名、多用户邮件服务——没有 SMTP 服务器要维护，没有 VPS 要续费。收件、阅读和站内互投的日常用量基本落在 Cloudflare 免费额度内；外发到任意外部地址需要 Workers Paid 计划。
 
 把任意多个域名的 catch-all 指向它，**任何前缀的地址都即收即用**：`abc@your-domain.com`、`x123@another.com` 不需要预先创建，来信全部落库。用户「认领」一个地址后即可用它收发；系统自动从来信里提取验证码；全套能力同时通过网页和开放 REST API 提供——后者配有一份专门写给 AI Agent 的操作指南，让 Claude / GPT 之类的 Agent 拿到用户名密码就能自己收发邮件、读验证码。
 
@@ -43,26 +43,30 @@ HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Ro
 
 - **零服务器** — 收发、存储、前端托管全部在 Cloudflare 上，部署完成后没有任何需要运维的进程
 - **任意前缀 catch-all** — 不用预建邮箱，注册网站时现编一个地址就能收到信；接码场景开箱即用
-- **验证码自动提取** — 正则同步提取 + Workers AI 兜底，列表角标、详情高亮、一键复制，API 里直接给 `verificationCode` 字段
+- **验证码自动提取** — 正则同步提取 + 可选的大模型兜底，列表角标、详情高亮、一键复制，API 里直接给 `verificationCode` 字段
 - **多域名 + 多用户** — 域名由管理后台动态维护（加域名不用重新部署）；地址认领制，全局唯一，认领即可见该地址全部历史邮件
-- **完整收发** — 回复线程化（In-Reply-To/References）、转发、CC/BCC、附件；外发走 Cloudflare `send_email`，可发送任意外部地址
+- **完整收发** — 回复线程化（In-Reply-To/References）、转发、CC/BCC、附件；外发走 Cloudflare `send_email`，在 Workers Paid 计划下可发送任意外部地址
 - **转发与通知到你常用的地方** — 每个用户独立配置：转发到任意外部邮箱（原生转发失败自动降级中转重发，带防环路守卫）、推送飞书卡片、回调通用 Webhook（Bark / ntfy / 自建）
 - **AI Agent 原生** — `/skill.md` 是一份部署在站点上的 Agent 操作说明书，`/v1/openapi.json` 提供 OpenAPI 3.1 描述
 - **push 即部署** — 一条 GitHub Actions 流水线：测试门控 → 构建 → 数据库迁移 → 部署 → 迁移完整性校验 → 线上冒烟
 
 ## 功能总览
 
+- **共享邮箱**：用户在「我的邮箱」共享自己的邮箱，管理员点击「全站地址」每行操作中的「共享邮箱」按钮，为当前邮箱选择共享成员，可共享给启用中的用户或管理员。成员只读历史和新来信、验证码与附件；支持调整或撤销名单。
+
 | 模块 | 主要能力 |
 | --- | --- |
 | **收件** | 多域名 catch-all、大正文自动落 R2、附件存 R2、失败隔离（只有落库失败才触发 SMTP 重试） |
 | **收件箱** | 全域名混排，按域名 / 地址 / 已读未读 / 星标 / 关键词（含正文）过滤，状态同步到 URL |
-| **验证码** | 正则同步提取 + Workers AI 兜底（可开关），角标展示与一键复制 |
+| **验证码** | 正则同步提取 + 大模型兜底（可开关），角标展示与一键复制 |
+| **AI 翻译** | 邮件详情一键翻译成简体中文，HTML 邮件保留排版，译文缓存、按用户限额 |
 | **发件** | 回复 / 转发 / CC / BCC / 附件，站内互投即时落库，外发配额可配 |
 | **转发通知** | 按「收件地址归属人」分流的个人偏好：邮箱转发（含中转降级）、飞书 Webhook 卡片（HMAC 签名 + 防 SSRF）、通用 Webhook |
-| **多用户** | admin / user 两角色；注册模式默认关闭（可开邀请码/开放）；地址认领制；域名可设「仅管理员」或开放认领，可按域名限制每人认领数 |
+| **托管域名** | 用户在「我的域名」填入自己的域名，系统用站长的 Cloudflare 账户建 zone 并给出 NS；用户改好 NS 后自动开通收件（catch-all）与发信，未认领地址的来信自动归域名所有者；域名可共享给其他用户认领地址、可过户，管理员可暂停、过户或删除任意托管域名 |
+| **多用户** | admin / user 两角色；注册模式默认关闭（可开邀请码/开放）；地址认领制；域名可设「仅管理员」或开放认领，可按域名限制每人认领数；支持用户专属域名范围、总数和单域名上限 |
 | **开放 API** | `/v1` 全套接口，API Key 支持 scope、每分钟限流、IP 白名单、过期时间与调用审计 |
 | **账户安全** | JWT + D1 强一致会话、改密 / 禁用即时踢线、TOTP 两步验证（可全局强制）、新 IP 登录飞书告警 |
-| **管理后台** | 注册模式（关闭 / 邀请码 / 开放）、域名管理、保留策略、外发配额、用户管理（含查看每人绑定邮箱） |
+| **管理后台** | 注册模式（关闭 / 邀请码 / 开放）、域名管理、保留策略、外发配额、用户管理（含查看每人绑定邮箱、配置专属邮箱权限） |
 
 ## 面向 AI Agent 设计
 
@@ -94,11 +98,9 @@ flowchart LR
         D1[(D1 业务数据)]
         KV[(KV 配置缓存/回滚兼容)]
         R2[(R2 附件/大正文)]
-        AI[Workers AI<br/>验证码兜底]
         W --- D1
         W --- KV
         W --- R2
-        W --- AI
     end
 
     B[浏览器 SPA] -->|同源 /api| W
@@ -106,6 +108,7 @@ flowchart LR
     W -->|send_email| OUT[任意外部收件人]
     W -->|Webhook 卡片| FS[飞书 / 通用 Webhook]
     W -->|forward / 中转降级| FW[外部邮箱转发]
+    W -->|OpenAI 兼容接口| LLM[大模型 如 DeepSeek<br/>验证码兜底 / 翻译]
 ```
 
 单个 Worker 同时承载三个入口：`fetch`（`/api` 内部接口 + `/v1` 开放接口 + 前端静态资源）、`email`（Email Routing catch-all 收件）、`scheduled`（每日清理）。前端构建产物打进 Worker Assets **同源部署**，`/api` 请求零跨域。
@@ -193,7 +196,7 @@ Cloudflare 账号，走 GitHub Actions 持续部署。逐步执行，每步验�
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/riba2534/hpc-mail)
 
-点击按钮后 Cloudflare 会：把仓库克隆到你的 GitHub → 自动创建 D1 / KV / R2 / Workers AI 资源并写入配置 → 引导你填入 `jwt_secret` → 构建并部署到 `*.workers.dev`，之后 push 到你的克隆仓库即由 Workers Builds 持续部署。
+点击按钮后 Cloudflare 会：把仓库克隆到你的 GitHub → 自动创建 D1 / KV / R2 资源并写入配置 → 引导你填入 `jwt_secret` → 构建并部署到 `*.workers.dev`，之后 push 到你的克隆仓库即由 Workers Builds 持续部署。
 
 部署完成后还差三步：
 
@@ -235,8 +238,12 @@ wrangler r2 bucket create hpc-cloud-mail-r2
 | Variable | `KV_NAMESPACE_ID` | 第 1 步输出的 KV ID |
 | Variable | `CUSTOM_DOMAIN` | 站点域名（Worker custom domain，不含 `https://`） |
 | Variable | `ADMIN_USERNAME` | 管理员用户名（3–32 位小写字母/数字/`-`/`_`） |
+| Secret（可选） | `CF_HOSTED_DOMAINS_TOKEN` | 开启「托管域名」：用户添加自己的域名时，Worker 用它在你的 Cloudflare 账户建 zone 并开通收发。不设置则该功能隐藏。权限见下方说明 |
+| Variable（可选） | `PLACEMENT_REGION` | Worker 放置区域，填 D1 主库附近的云区域（如主库在美西填 `aws:us-west-1`，在新加坡填 `aws:ap-southeast-1`）。设置后 API 请求在数据库附近执行，每个请求只跨一次远程；不设则在离用户最近的节点执行。D1 主库位置在建库时用 `wrangler d1 create --location <wnam/enam/weur/apac…>` 指定，应选在多数访问的入口节点附近（Cloudflare 日志里的 colo） |
 
 > **API Token 权限**：用「Edit Cloudflare Workers」模板创建，再手动补两条——**Account → D1:Edit**（模板不含）、**Zone → Workers Routes:Edit** 且 Zone Resources 勾选 `CUSTOM_DOMAIN` 所在 zone（缺这条会在「部署 Worker」步骤失败）。
+>
+> **托管域名 Token（可选）**：单独创建一个 Token，权限 **Zone → Zone:Edit、DNS:Edit、Zone Settings:Edit、Email Routing Rules:Edit**，**Account → Email Sending:Edit**；Zone Resources 选「All zones from an account」并 **Exclude 站点域名等关键 zone**。部署时 CI 把它与 `CLOUDFLARE_ACCOUNT_ID` 写入 Worker secrets（`cf_api_token` / `cf_account_id`）。用户的域名会成为你账户下的 zone：收件、发信额度与信誉都算在你的账户上，可在后台「托管域名」页暂停或删除。Cloudflare 在账户超过 50 个 zone 且 pending 多于 active 时禁止新增，后台「系统设置 → 域名托管」可限制每人域名数与同时等待生效的数量。
 
 **3. 首次部署**：fork 仓库的 **Actions 默认是禁用的**——先进仓库 Actions 页点击启用，然后在 `Deploy HPC Mail` workflow 手动 **Run workflow**（刚 fork 没有新提交，push 不会自动触发）。全新空 D1 **不需要**勾 `reset_database`，迁移会自动从零建表；只有复用了含旧表的数据库才勾它（危险：会清空数据）。此后每次 push 到 `main` 自动部署。
 
@@ -300,14 +307,14 @@ git fetch upstream && git merge upstream/main && git push          # push 即触
 <details>
 <summary><b>需要自己的邮件服务器或第三方发信服务吗？</b></summary>
 
-不需要。收件走 Cloudflare Email Routing，外发走 Workers 的 `send_email` binding，可以发送到任意外部地址。整套系统没有传统 MTA。
+不需要。收件走 Cloudflare Email Routing，外发走 Workers 的 `send_email` binding。发往任意外部地址需要 Workers Paid 计划；Workers Free 只能发往账户内已验证的目标地址。整套系统没有传统 MTA。
 
 </details>
 
 <details>
 <summary><b>要花多少钱？</b></summary>
 
-个人用量通常落在 Cloudflare 免费额度内：Workers 免费版每天 10 万请求，D1 / KV / R2 免费层对邮箱场景都很充裕。两点注意：**Workers AI 验证码兜底默认开启**，超出免费日额度后按量计费（可在管理后台关闭，正则提取不受影响）；R2 首次开通需要绑定支付方式。域名本身的费用除外。相关限额：收件正文超过 256KB 时完整正文落 R2，附件总大小上限 50MB / 单封最多 10 个。
+收件、阅读和站内互投的个人用量通常落在 Cloudflare 免费额度内：Workers 免费版每天 10 万请求，D1 / KV / R2 免费层对邮箱场景都很充裕。外发到任意外部地址需要 Workers Paid 计划（每月含 3,000 封，超出按 $0.35 / 千封计费）；外部收件人逐个单独发送，每个收件人计 1 封。另外两点注意：验证码兜底识别与邮件翻译需要在管理后台「AI 模型」中配置 OpenAI 兼容接口（如 DeepSeek），费用按该服务计；不配置时只用正则识别验证码。启用后，含验证码关键词但正则未识别出的来信、以及用户点击翻译的邮件片段会发送到该服务；R2 首次开通需要绑定支付方式。域名本身的费用除外。相关限额：收件正文超过 256KB 时完整正文落 R2，附件总大小上限 50MB / 单封最多 10 个。
 
 </details>
 

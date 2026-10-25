@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { userMailboxPolicySchema, type UserMailboxPolicy } from './mailbox-policy.js';
 import {
   PASSWORD_MAX_LENGTH,
   PASSWORD_MIN_LENGTH,
@@ -97,6 +98,24 @@ export interface LoginResponse {
 
 // ---- 管理端用户管理 ----
 
+export const searchUsersQuerySchema = z.object({
+  q: z.string().trim().toLowerCase().min(1, '请输入用户名搜索').max(32),
+  excludeUserId: z.coerce.number().int().positive().optional(),
+  limit: z.coerce.number().int().min(1).max(20).default(20),
+});
+export type SearchUsersQuery = z.infer<typeof searchUsersQuerySchema>;
+
+export interface UserSearchResult {
+  id: number;
+  username: string;
+  role: Role;
+}
+
+export interface UserSearchResults {
+  items: UserSearchResult[];
+  hasMore: boolean;
+}
+
 export const createUserRequestSchema = z.object({
   username: usernameSchema,
   password: passwordSchema,
@@ -109,9 +128,15 @@ export const updateUserRequestSchema = z
     status: z.enum(USER_STATUSES).optional(),
     role: z.enum(ROLES).optional(),
     password: passwordSchema.optional(),
+    mailboxPolicy: userMailboxPolicySchema.nullable().optional(),
+    expectedMailboxPolicyRevision: z.number().int().min(0).optional(),
   })
-  .refine((v) => v.status !== undefined || v.role !== undefined || v.password !== undefined, {
+  .refine((v) => v.status !== undefined || v.role !== undefined || v.password !== undefined || v.mailboxPolicy !== undefined, {
     message: '至少提供一个待更新字段',
+  })
+  .refine((v) => v.mailboxPolicy === undefined || v.expectedMailboxPolicyRevision !== undefined, {
+    path: ['expectedMailboxPolicyRevision'],
+    message: '修改邮箱权限需提供当前配置版本',
   });
 export type UpdateUserRequest = z.infer<typeof updateUserRequestSchema>;
 
@@ -121,6 +146,9 @@ export interface AdminUser {
   role: Role;
   status: UserStatus;
   mailboxCount: number;
+  /** null=公共配置；非空时替代公共域名与认领额度。管理员始终豁免。 */
+  mailboxPolicy: UserMailboxPolicy | null;
+  mailboxPolicyRevision: number;
   /** 名下已认领的邮箱地址列表（与 mailboxCount 对应） */
   mailboxes: string[];
   /** 名下 API Key 数（删除用户前确认后果用） */

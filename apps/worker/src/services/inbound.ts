@@ -1,49 +1,50 @@
 import {
-  EXTERNAL_MESSAGE_MAX_BYTES,
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_TOTAL_BYTES,
 } from '@hpc-mail/shared';
-import PostalMime from 'postal-mime';
-import { eq } from 'drizzle-orm';
+import PostalMime, { type Address } from 'postal-mime';
+import { and, eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { attachments as attachmentsTable, messages } from '../db/schema.js';
 import { getEmailDomain, getNameFromEmail, normalizeEmail } from '../lib/email-address.js';
-import { hmacSha256Base64, sha256Hex } from '../lib/crypto.js';
-import { encodeBodyBase64, foldBase64, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
-import { htmlToText, makePreview } from '../lib/text.js';
+import { sha256Hex } from '../lib/crypto.js';
+import { mailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
-import { extractCodeByAi, extractCodeByRegex } from './code-extract.js';
-import { sendFeishuNotification } from './feishu.js';
-import { resolveNotifyOwnerIds } from './mailbox.js';
-import { getUserNotifyPrefs } from './notify-prefs.js';
+import { isAiModelConfigured } from './ai-provider.js';
+import { extractCodeByAi, extractCodeByRegex, wantsAiCode } from './code-extract.js';
+import { extractVerificationLink } from './link-extract.js';
+import {
+  LEGACY_NOTIFY_KEYS,
+  loadNotifyOwners,
+  notifyOwnersFromRows,
+  type NotifyOwner,
+  type NotifyOwnerRawRow,
+} from './notify-prefs.js';
 import { bumpCounter, dayWindow } from './rate-counter.js';
 import { getSettings } from './setting.js';
-import { sendNotifyWebhook } from './webhook-notify.js';
-import { attachmentKey, bodyKey, getExt, putJson, putObject, sha256Hex16 } from './storage.js';
+import { bodyBytes, D1_BODY_LIMIT, storeMailBody } from './mail-body.js';
+import { forwardReceivedMail } from './forwarding.js';
+import { HOSTED_AUTO_CLAIM_SQL, HOSTED_STATUS_SQL, NOTIFY_OWNER_IDS_SQL, hostedRejectReason } from './mailbox.js';
+import { enqueueMailNotifications } from './notification-jobs.js';
+import { attachmentKey, getExt, putObject, sha256Hex16 } from './storage.js';
+import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
 
 /** 未认领 catch-all 转发必须按稳定主体限额，不能让随机 local-part 刷新额度。 */
-const DAILY_FORWARD_DOMAIN_LIMIT = 500;
-const DAILY_FORWARD_TARGET_LIMIT = 200;
 const DAILY_AI_EXTRACT_LIMIT = 500;
 
-const D1_BODY_LIMIT = 256 * 1024;
-const TRUNCATE_BYTES = 64 * 1024;
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 
-function byteLen(s: string): number {
-  return encoder.encode(s).length;
-}
+/** 附件并行写 R2 的并发上限 */
+const ATTACHMENT_UPLOAD_CONCURRENCY = 4;
+/** 附件元数据每行 7 个绑定参数，单条 INSERT 不超过 D1 的 100 参数上限 */
+const ATTACHMENT_INSERT_BATCH = 12;
 
-/**
- * 按**字节**截断（此前用 String.slice 按 UTF-16 码元截，中文一个字符 3 字节，
- * 「64KB 截断」实际能写进 D1 近 192KB，text+html 合计约 384KB——远超设计值）。
- * TextDecoder 的 fatal:false 会把末尾截断的多字节序列替换成 U+FFFD，不会产生非法字符串。
- */
-function truncateBytes(s: string, maxBytes: number): string {
-  const bytes = encoder.encode(s);
-  if (bytes.byteLength <= maxBytes) return s;
-  return decoder.decode(bytes.subarray(0, maxBytes));
+/** 有限并发执行；任一失败整体 reject（与串行时「任一失败即抛出」语义一致） */
+async function runLimited<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) await task(items[next++]!);
+  }));
 }
 
 interface ParsedAttachment {
@@ -56,127 +57,82 @@ interface ParsedAttachment {
   size: number;
 }
 
-function uint8ToBase64(bytes: Uint8Array): string {
-  let bin = '';
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(bin);
-}
-
-const HTML_ESCAPES: Record<string, string> = {
-  '&': '&amp;',
-  '<': '&lt;',
-  '>': '&gt;',
-  '"': '&quot;',
-  "'": '&#39;',
+const duplicateColumns = {
+  id: messages.id,
+  status: messages.status,
+  errorDetail: messages.errorDetail,
+  rawR2Key: messages.rawR2Key,
+  bodyR2Key: messages.bodyR2Key,
+  deletedAt: messages.deletedAt,
+  notifyOwnerIds: messages.notifyOwnerIds,
 };
-const escapeHtml = (s: string): string => s.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]!);
 
-interface RelayMail {
-  fromAddress: string;
-  fromName: string;
-  toAddress: string;
-  domain: string;
-  subject: string;
-  text: string;
-  html: string;
-  attachments: ParsedAttachment[];
+/** 同一 ingestKey 已落库的那一行（合批读取时按原始列名映射，并发竞争时由 drizzle 重读） */
+interface DuplicateRow {
+  id: number;
+  status: string;
+  errorDetail: string;
+  rawR2Key: string | null;
+  bodyR2Key: string | null;
+  deletedAt: unknown;
+  notifyOwnerIds: number[] | null;
 }
 
-async function relayMarker(env: Env): Promise<string> {
-  return hmacSha256Base64(new TextEncoder().encode(env.jwt_secret), 'hpc-mail-relay:v1');
+interface InboundLookup {
+  /** 托管域名未生效或已停用时的拒收原因 */
+  rejected: string | null;
+  duplicate: DuplicateRow | undefined;
+  ownerIds: number[];
+  ownerRows: NotifyOwnerRawRow[];
+  legacyRows: { key: string; value: string }[];
 }
 
 /**
- * 中转转发：原生 forward() 仅对 Email Routing 已验证 destination 生效，目标未验证时
- * 降级为 send_email binding 以 no-reply@收件域名 重新打包发送——保留原始标题/正文/附件，
- * Reply-To 指回原发件人，正文顶部加转发元信息块。
+ * Ack 前唯一一次 D1 读：去重行、收信当时的归属人、归属人的状态与偏好、旧全局通知设置，
+ * 合成一个 batch 往返。偏好行只在邮件完整落库后才解析。
+ * 全部是原生 SQL、各自显式绑定：归属人子查询复用 NOTIFY_OWNER_IDS_SQL（?1 = 收件地址），
+ * 不能与 drizzle 生成的匿名 ? 混在同一条语句里，否则新增条件会和 ?1 撞到同一槽位而静默绑错。
+ * 托管域名的未认领地址在归属结算前认领给域名所有者（同一事务），暂停或删除中的托管域名拒收。
  */
-async function relayForward(env: Env, target: string, mail: RelayMail): Promise<void> {
-  // 动态 import：`cloudflare:email`/`mimetext` 静态加载会让 vitest 的 workerd 崩（同 outbound.ts）
-  const [{ EmailMessage }, { createMimeMessage, Mailbox }] = await Promise.all([
-    import('cloudflare:email'),
-    import('mimetext/browser'),
+async function lookupInbound(env: Env, ingestKey: string, address: string, domain: string): Promise<InboundLookup> {
+  const [dup, , hosted, owners, ownerUserRows, legacy] = await env.db.batch([
+    env.db.prepare(`SELECT id, status, error_detail, raw_r2_key, body_r2_key, deleted_at, notify_owner_ids
+      FROM messages WHERE ingest_key = ?1`).bind(ingestKey),
+    env.db.prepare(HOSTED_AUTO_CLAIM_SQL).bind(address, domain),
+    env.db.prepare(HOSTED_STATUS_SQL).bind(address, domain),
+    env.db.prepare(NOTIFY_OWNER_IDS_SQL).bind(address),
+    env.db.prepare(`select "id", "status", "role", "notify_prefs" from "users" where "id" in (${NOTIFY_OWNER_IDS_SQL})`).bind(address),
+    env.db.prepare(`SELECT key, value FROM settings WHERE key IN (${LEGACY_NOTIFY_KEYS.map((_, i) => `?${i + 1}`).join(', ')})`)
+      .bind(...LEGACY_NOTIFY_KEYS),
   ]);
-  const sender = `no-reply@${mail.domain}`;
-  const origin = mail.fromName ? `${mail.fromName} <${mail.fromAddress}>` : mail.fromAddress;
-  const metaLines = [
-    `原始发件人: ${origin}`,
-    `原收件地址: ${mail.toAddress}`,
-    '直接回复本邮件将发送给原始发件人。',
-  ];
-
-  // send_email 对单封邮件有硬限（EXTERNAL_MESSAGE_MAX_BYTES 是留了余量的阈值）。
-  // 此前这里把附件无条件全塞进 MIME，超限时 send 直接抛错、调用方只打一行 console.error，
-  // 结果是「转发静默丢失」——用户以为压根没收到这封信。超限就改为不带附件并在正文说明。
-  const bodyBytes = new TextEncoder().encode(mail.text + mail.html).length;
-  const attachmentBytes = mail.attachments.reduce(
-    (sum, a) => sum + Math.ceil((a.content.byteLength * 4) / 3),
-    0,
-  );
-  const dropAttachments =
-    mail.attachments.length > 0 && bodyBytes + attachmentBytes > EXTERNAL_MESSAGE_MAX_BYTES;
-  if (dropAttachments) {
-    const totalMb = (mail.attachments.reduce((s, a) => s + a.content.byteLength, 0) / 1024 / 1024).toFixed(1);
-    metaLines.push(
-      `注意：原邮件的 ${mail.attachments.length} 个附件（共 ${totalMb} MB）超出转发大小限制，未随本信转发，请登录 https://${mail.domain} 查看下载。`,
-    );
-  }
-
-  const msg = createMimeMessage();
-  msg.setSender({ name: `${mail.fromName || mail.fromAddress} (via HPC Mail)`, addr: sender });
-  msg.setRecipient(target);
-  msg.setSubject(mail.subject || '(无主题)');
-  msg.setHeader('X-HPC-Mail-Relay', await relayMarker(env));
-  // mimetext 对 Reply-To 这类已知头校验值类型，必须传 Mailbox 对象（传字符串会抛错）
-  if (mail.fromAddress) msg.setHeader('Reply-To', new Mailbox(mail.fromAddress));
-  msg.addMessage({
-    contentType: 'text/plain',
-    charset: 'UTF-8',
-    encoding: 'base64',
-    data: encodeBodyBase64(
-      `———— HPC Mail 转发 ————\n${metaLines.join('\n')}\n————————————————\n\n${mail.text || htmlToText(mail.html)}`,
-    ),
-  });
-  if (mail.html) {
-    const metaHtml =
-      '<div style="margin:0 0 16px;padding:10px 14px;border-left:3px solid #8b8fa3;background:#f5f6f8;color:#4b4f5c;font-size:12px;line-height:1.9">' +
-      '<div style="font-weight:600">HPC Mail 转发</div>' +
-      metaLines.map((l) => `<div>${escapeHtml(l)}</div>`).join('') +
-      '</div>';
-    msg.addMessage({
-      contentType: 'text/html',
-      charset: 'UTF-8',
-      encoding: 'base64',
-      data: encodeBodyBase64(metaHtml + mail.html),
-    });
-  }
-  if (!dropAttachments) {
-    for (const a of mail.attachments) {
-      // 折行成 76 字符/行：不折行时整个附件是一整行，超 SMTP 998 字节行限会被下游 MTA 拒收。
-      // filename/mimeType 必须清洗：它们来自站外发件人，而 mimetext 是裸拼进头的
-      msg.addAttachment({
-        filename: sanitizeFilename(a.filename),
-        contentType: sanitizeMimeType(a.mimeType),
-        data: foldBase64(uint8ToBase64(a.content)),
-      });
-    }
-  }
-  await env.email.send(new EmailMessage(sender, target, msg.asRaw()));
+  const row = dup?.results[0] as {
+    id: number; status: string; error_detail: string; raw_r2_key: string | null; body_r2_key: string | null;
+    deleted_at: number | null; notify_owner_ids: string | null;
+  } | undefined;
+  return {
+    rejected: hostedRejectReason(hosted),
+    duplicate: row && {
+      id: Number(row.id), status: row.status, errorDetail: row.error_detail ?? '',
+      rawR2Key: row.raw_r2_key, bodyR2Key: row.body_r2_key, deletedAt: row.deleted_at,
+      notifyOwnerIds: row.notify_owner_ids === null ? null : JSON.parse(row.notify_owner_ids) as number[],
+    },
+    ownerIds: (owners?.results ?? []).map((item) => Number((item as { id: number }).id)),
+    ownerRows: (ownerUserRows?.results ?? []) as NotifyOwnerRawRow[],
+    legacyRows: (legacy?.results ?? []) as { key: string; value: string }[],
+  };
 }
 
 /**
- * 收件链路：解析 → 提码 → 正文分层/附件落 R2 → 落库 → 同步邮箱转发（原生 forward 优先，
- * 未验证目标降级中转）→ waitUntil(AI 兜底 + 飞书)。仅落库失败 throw（触发 SMTP 重试）。
+ * 收件链路：解析 → 去重 + 归属人 + 偏好的 D1 batch（往返期间完成提码与摘要）→ 非重复时原文/大正文并行写 R2
+ * → 落库 → 附件落 R2 → waitUntil(邮箱转发、AI 兜底 + 通知队列)。原文/正文/附件未完整保存则 SMTP 重试。
  */
 export async function handleInbound(
   message: ForwardableEmailMessage,
   env: Env,
   ctx: ExecCtx,
 ): Promise<void> {
-  const settings = await getSettings(env);
+  // 设置读取（isolate 内存缓存未命中时直读 D1）与原文缓冲、解析重叠，提码前才等待
+  const settingsReady = getSettings(env, ctx);
 
   // 先缓冲原始 .eml（stream 只能读一次），解析与幂等摘要共用这一份字节。
   const rawBytes = new Uint8Array(await new Response(message.raw).arrayBuffer());
@@ -207,14 +163,12 @@ export async function handleInbound(
   const fromAddress = normalizeEmail(email.from?.address);
   const fromName = (email.from?.name || getNameFromEmail(fromAddress)).trim().slice(0, 512);
 
-  const mapAddrs = (list: { address?: string }[] | undefined): string[] =>
-    (list ?? []).map((x) => normalizeEmail(x.address)).filter(Boolean).slice(0, 200);
+  const mapAddrs = (list: Address[] | undefined): string[] =>
+    [...new Set((list ?? []).flatMap(item => item.group ?? [item])
+      .map(item => normalizeEmail(item.address)).filter(Boolean))].slice(0, 200);
   const toList = mapAddrs(email.to);
-  const recipients = {
-    to: toList.length ? toList : [toAddress],
-    cc: mapAddrs(email.cc),
-    bcc: mapAddrs(email.bcc),
-  };
+  const recipients = { to: toList.length ? toList : [toAddress], cc: mapAddrs(email.cc), bcc: mapAddrs(email.bcc) };
+  const replyTo = mapAddrs(email.replyTo);
 
   const subject = (email.subject || '').slice(0, 2048);
   const text = email.text || '';
@@ -223,28 +177,24 @@ export async function handleInbound(
   const sourceReferences = (email.references || '').slice(0, 4096);
   const ingestKey = await sha256Hex(`${toAddress}\n${sourceMessageId}\n${rawDigest}`);
   const db = createDb(env);
-  const duplicate = await db
-    .select({ id: messages.id })
-    .from(messages)
-    .where(eq(messages.ingestKey, ingestKey))
-    .get();
-  if (duplicate) return;
+  const bodySize = bodyBytes(text, html);
 
-  // 幂等检查完成后再存原文；确定性 key 让并发重投覆盖同一对象，而不是制造随机孤儿。
-  let rawR2Key: string | null = null;
-  try {
-    const key = `raw/${ingestKey}.eml`;
-    await env.r2.put(key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } });
-    rawR2Key = key;
-  } catch (e) {
-    console.error('原始邮件存档失败:', e);
-  }
+  // 去重读先发出，往返期间完成 CPU 部分；R2 写入等去重结果出来、确认不是重复投递之后才开始。
+  const lookupReady = lookupInbound(env, ingestKey, toAddress, domain);
+  // 下方 CPU 部分若抛错，lookupReady 的失败不能成为未处理的 rejection
+  lookupReady.catch(() => {});
 
-  // 同步正则提码
+  // HTML → 纯文本只转换一次，提码、摘要、AI 兜底、通知与转发共用。
+  const settings = await settingsReady;
+  const body = mailText(text, html);
+  // 同步正则提码 + 验证链接识别（同受「自动提取」开关控制）
   let code = '';
+  let verificationLink = '';
   if (settings.code_extract.enabled) {
-    code = extractCodeByRegex(subject, text || htmlToText(html));
+    code = extractCodeByRegex(subject, body.plain);
+    verificationLink = extractVerificationLink({ subject, text, html, fromAddress });
   }
+  const preview = body.preview();
 
   // 附件落 R2 前先算内容
   let attachmentBytes = 0;
@@ -272,29 +222,47 @@ export async function handleInbound(
     });
   }
   const attachmentsSize = parsedAttachments.reduce((sum, a) => sum + a.size, 0);
+  const attachmentHashes = await Promise.all(parsedAttachments.map((att) => sha256Hex16(att.content)));
 
-  // 正文分层：>256KB 存 64KB 截断 + 完整 JSON 落 R2
-  let bodyText = text;
-  let bodyHtml = html;
-  let bodyR2Key: string | null = null;
-  if (byteLen(text) + byteLen(html) > D1_BODY_LIMIT) {
-    const key = bodyKey(ingestKey);
-    try {
-      await putJson(env, key, { text, html });
-      bodyR2Key = key;
-    } catch (e) {
-      console.error('正文溢出落 R2 失败，降级仅存截断:', e);
-    }
-    bodyText = truncateBytes(text, TRUNCATE_BYTES);
-    bodyHtml = truncateBytes(html, TRUNCATE_BYTES);
+  const lookup = await lookupReady;
+  if (lookup.rejected) {
+    message.setReject(lookup.rejected);
+    return;
   }
+  let duplicate = lookup.duplicate;
+  // 已删除或已完整的重复投递：在任何 R2 写入之前返回
+  if (duplicate?.deletedAt || (duplicate && (duplicate.status === 'received' ||
+    (duplicate.status === 'degraded' && !duplicate.errorDetail.includes('保存失败'))) && duplicate.rawR2Key &&
+    (bodySize <= D1_BODY_LIMIT || duplicate.bodyR2Key))) return;
 
-  const preview = makePreview(text, html);
-  const size = byteLen(text) + byteLen(html) + attachmentsSize;
+  // 接受 SMTP 投递前必须保存原文与完整正文；存储故障由 SMTP 重投恢复，不能接受丢失正文。
+  // 两次写入并行；rawBytes 只作为实参直接传给 put，不被任何闭包捕获——否则会随 waitUntil
+  // 后处理一直持有整封原始 .eml。
+  const rawR2Key = `raw/${ingestKey}.eml`;
+  const [, { bodyText, bodyHtml, bodyR2Key }] = await Promise.all([
+    env.r2.put(rawR2Key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } }),
+    storeMailBody(env, text, html, ingestKey, bodySize),
+  ]);
 
-  // 消息落库：失败向上抛出触发 SMTP 重试
+  const size = bodySize + attachmentsSize;
+  const ownerIds = duplicate?.notifyOwnerIds ?? lookup.ownerIds;
+
+  const finalState = {
+    status: attachmentsDropped ? 'degraded' : 'received',
+    errorDetail: attachmentsDropped ? '部分附件超过数量或总大小上限，请下载原始邮件查看' : '',
+  };
+  // 无附件的新邮件在插入时就已完整（原文/正文已落 R2），直接写最终状态，省掉 pending → 完整的回写；
+  // 有附件时仍先写 pending，附件保存成功后再原子转为完整状态。
+  const completeOnInsert = !duplicate && parsedAttachments.length === 0;
+
+  // 消息落库：失败向上抛出触发 SMTP 重试。
+  // 补投修复先单独提交字段回写（上传附件之前），附件失败时刚写入的原文/正文也已被这一行引用。
   let inserted: { id: number } | undefined;
-  try {
+  if (duplicate) {
+    await db.update(messages).set({ bodyText, bodyHtml, bodyR2Key, rawR2Key, replyTo, notifyOwnerIds: ownerIds })
+      .where(eq(messages.id, duplicate.id));
+    inserted = { id: duplicate.id };
+  } else try {
     inserted = await db.insert(messages).values({
       direction: 'inbound',
       address: toAddress,
@@ -302,6 +270,8 @@ export async function handleInbound(
       fromAddress,
       fromName,
       recipients,
+      replyTo,
+      notifyOwnerIds: ownerIds,
       subject,
       preview,
       bodyText,
@@ -310,10 +280,11 @@ export async function handleInbound(
       rawR2Key,
       ingestKey,
       verificationCode: code,
+      verificationLink,
       messageId: sourceMessageId || null,
       inReplyTo: (email.inReplyTo || '').slice(0, 998) || null,
       references: sourceReferences,
-      status: attachmentsDropped ? 'degraded' : 'received',
+      status: completeOnInsert ? finalState.status : 'pending',
       errorDetail: attachmentsDropped ? '部分附件超过数量或总大小上限，请下载原始邮件查看' : '',
       isRead: false,
       size,
@@ -322,141 +293,105 @@ export async function handleInbound(
   } catch (error) {
     // 并发重复投递：另一请求已成功落库，确定性 R2 key 属于那条记录，不能删除。
     const raced = await db
-      .select({ id: messages.id })
+      .select(duplicateColumns)
       .from(messages)
       .where(eq(messages.ingestKey, ingestKey))
       .get();
-    if (raced) return;
-    const cleanup = [rawR2Key, bodyR2Key].filter((key): key is string => !!key);
-    if (cleanup.length) {
-      try {
-        await env.r2.delete(cleanup);
-      } catch (cleanupError) {
-        console.error('入站落库失败补偿清理异常:', cleanupError);
-      }
-    }
-    throw error;
+    if (raced && (raced.status === 'received' || raced.status === 'degraded')) return;
+    if (!raced) throw error;
+    duplicate = raced;
+    inserted = { id: raced.id };
   }
   if (!inserted) throw new Error('入站邮件落库未返回 id');
   const messageId = inserted!.id;
 
-  // 附件上传 + 落库（best-effort，不阻断收件成功）
-  if (parsedAttachments.length) {
-    const uploadedKeys: string[] = [];
+  // 附件上传 + 落库：失败保留 pending，下次原始邮件重投修复同一条记录。
+  // R2 并行写（并发 4）；附件元数据与「pending → 完整」状态切换同一个 D1 事务往返。
+  const pendingRecovery = !duplicate || duplicate.status === 'pending';
+  const markComplete = db.update(messages).set(finalState).where(pendingRecovery
+    ? and(eq(messages.id, messageId), eq(messages.status, 'pending'))
+    : eq(messages.id, messageId)).returning({ id: messages.id });
+  let completed: boolean;
+  if (completeOnInsert && !duplicate) {
+    completed = true;
+  } else if (parsedAttachments.length) {
     try {
-      const rows = [];
-      for (const att of parsedAttachments) {
-        const hash16 = await sha256Hex16(att.content);
-        const key = attachmentKey(messageId, att.seq, hash16, getExt(att.filename));
-        await putObject(env, key, att.content, att.mimeType);
-        uploadedKeys.push(key);
-        rows.push({
-          messageId,
-          r2Key: key,
-          filename: att.filename,
-          mimeType: att.mimeType,
-          size: att.size,
-          contentId: att.contentId,
-          disposition: att.disposition,
-        });
+      const rows: typeof attachmentsTable.$inferInsert[] = parsedAttachments.map((att, index) => ({
+        messageId,
+        r2Key: attachmentKey(messageId, att.seq, attachmentHashes[index]!, getExt(att.filename)),
+        filename: att.filename,
+        mimeType: att.mimeType,
+        size: att.size,
+        contentId: att.contentId,
+        disposition: att.disposition,
+      }));
+      await runLimited(rows.map((row, index) => ({ row, att: parsedAttachments[index]! })), ATTACHMENT_UPLOAD_CONCURRENCY,
+        ({ row, att }) => putObject(env, row.r2Key, att.content, att.mimeType));
+      // 补偿重投不重复增加附件行：(message_id, r2_key) 唯一索引去重，每个已保存对象有稳定 key。
+      const inserts = [];
+      for (let start = 0; start < rows.length; start += ATTACHMENT_INSERT_BATCH) {
+        inserts.push(db.insert(attachmentsTable).values(rows.slice(start, start + ATTACHMENT_INSERT_BATCH)).onConflictDoNothing());
       }
-      await db.insert(attachmentsTable).values(rows);
+      // batch 是事务：任一附件行写入失败，状态切换一并回滚，邮件保持 pending
+      const [marked] = await db.batch([markComplete, ...inserts]);
+      completed = marked.length > 0;
     } catch (e) {
       console.error('附件入库失败:', e);
-      if (uploadedKeys.length) {
-        try {
-          await env.r2.delete(uploadedKeys);
-        } catch (cleanupError) {
-          console.error('附件失败补偿清理异常:', cleanupError);
-        }
-      }
-      await db
-        .update(messages)
-        .set({ status: 'degraded', errorDetail: '附件保存失败，请下载原始邮件查看' })
-        .where(eq(messages.id, messageId));
-    }
-  }
-
-  // 归属解析：收件地址所属用户 → 其个人偏好；未认领地址归全部管理员，按各自个人偏好处理。
-  // 整体 try/catch：这几个调用都在 D1 落库**之后**，结果只用于转发/通知。裸 await 的话
-  // 一次 D1 读超时就会让 handler reject → SMTP 重投 → 上一轮已成功的 insert 变成重复入库
-  // （同一封信在收件箱里出现多份，验证码邮件尤其容易误判）。约定是只有落库失败才 throw。
-  let ownerPrefs: Awaited<ReturnType<typeof getUserNotifyPrefs>>[] = [];
-  try {
-    const ownerIds = await resolveNotifyOwnerIds(env, toAddress);
-    ownerPrefs = await Promise.all(ownerIds.map((id) => getUserNotifyPrefs(env, id)));
-  } catch (e) {
-    console.error('归属/通知偏好解析失败，跳过转发与通知（邮件已入库）:', e);
-  }
-
-  // 同步邮箱转发（按 owner 的个人转发目标，去重；逐地址 try/catch）
-  // 已验证 destination 走原生 forward()（原样转发，保留原始邮件头/签名）；
-  // 未验证目标 forward() 会抛错，降级 relayForward 中转重发，任意外部邮箱均可送达。
-  // 防环路：中转副本带 X-HPC-Mail-Relay 头，再次入站不重复转发；目标为收件地址自身时跳过。
-  const isRelayedCopy = message.headers.get('x-hpc-mail-relay') === await relayMarker(env);
-  const forwardTargets = isRelayedCopy
-    ? []
-    : [
-        ...new Set(ownerPrefs.filter((p) => p.forward.enabled).flatMap((p) => p.forward.addresses)),
-      ].filter((t) => normalizeEmail(t) !== toAddress);
-  // 转发是一条无需登录即可触发的外发通道：任何人往公开域名的地址群发，每封都会被以
-  // 我们的域名重新投递给最多 5 个目标（1 进 5 出的放大器，烧的是发件域名信誉）。
-  // 外发配额只管 sendMail，这里补一个按收件地址计的日上限。
-  const relayWindow = dayWindow();
-  for (const target of forwardTargets) {
-    let quotaOk = true;
-    try {
-      const [domainUsage, targetUsage] = await Promise.all([
-        bumpCounter(env, 'fwd-domain', domain, relayWindow, 1),
-        bumpCounter(env, 'fwd-target', normalizeEmail(target), relayWindow, 1),
-      ]);
-      quotaOk =
-        domainUsage.count <= DAILY_FORWARD_DOMAIN_LIMIT &&
-        targetUsage.count <= DAILY_FORWARD_TARGET_LIMIT;
-    } catch (e) {
-      // 通知转发不是收件主链路；计数器异常时 fail closed，避免公开 catch-all 变成外发放大器。
-      quotaOk = false;
-      console.error('转发配额计数失败，本次跳过:', e);
-    }
-    if (!quotaOk) {
-      console.warn(`转发到 ${target} 跳过：域名或目标地址今日额度已用尽`);
-      continue;
-    }
-    try {
-      await message.forward(target);
-    } catch (forwardErr) {
       try {
-        await relayForward(env, target, {
-          fromAddress,
-          fromName,
-          toAddress,
-          domain,
-          subject,
-          text,
-          html,
-          attachments: parsedAttachments,
-        });
-      } catch (relayErr) {
-        console.error(`转发到 ${target} 失败（原生 forward 与中转均未成功）:`, forwardErr, relayErr);
-      }
+        await db.update(messages).set({ status: 'pending', errorDetail: '附件保存失败，等待投递重试恢复' })
+          .where(eq(messages.id, messageId));
+      } catch (updateError) { console.error('附件降级状态保存失败:', updateError); }
+      throw e;
     }
+  } else {
+    completed = !!(await markComplete.get());
   }
+  // 并发修复只有将 pending 原子转为完整状态的一方执行转发与通知。
+  if (!completed) return;
+  // 旧完整消息补存原文时不重复转发；pending 消息从未进入后处理，恢复后正常通知。
+  if (duplicate && duplicate.status !== 'pending') return;
+
+  // 转发偏好来自收件时保存的 owner 快照：状态与偏好已随去重查询读出，转发、入队与即时投递共用；
+  // 修复投递的快照里有当时不再是归属人的用户时补读一次。偏好读取失败不影响已经可靠落库的邮件。
+  const resolvedOwners = new Set(lookup.ownerIds);
+  const ownersReady = (async (): Promise<Map<number, NotifyOwner> | undefined> => {
+    try {
+      return ownerIds.every((id) => resolvedOwners.has(id))
+        ? notifyOwnersFromRows(lookup.ownerRows, lookup.legacyRows)
+        : await loadNotifyOwners(env, ownerIds);
+    } catch (e) {
+      console.error('通知偏好解析失败，跳过转发（邮件与归属快照已入库）:', e);
+      return undefined;
+    }
+  })();
+
+  ctx.waitUntil(ownersReady.then((owners) => forwardReceivedMail(env, {
+    messageId, ownerIds,
+    fromAddress, fromName, toAddress, domain, subject, text, html, replyTo,
+    attachments: parsedAttachments, mailText: body,
+  }, owners ? ownerIds.map((id) => owners.get(id)?.prefs ?? DEFAULT_USER_NOTIFY_PREFS) : [], message))
+    .catch(error => console.error('入站转发后处理失败:', error)));
 
   // 异步后处理：AI 兜底提码 + 按 owner 个人偏好的飞书/通用 webhook（各自 try/catch 隔离）
   ctx.waitUntil(
     (async () => {
       let finalCode = code;
-      if (!finalCode && settings.code_extract.enabled && settings.code_extract.aiEnabled) {
+      let codeSaved: Promise<void> | undefined;
+      // 模型未配置、或邮件里没有验证码相关词时不外发、也不占每域额度
+      if (!finalCode && settings.code_extract.enabled && settings.code_extract.aiEnabled
+        && isAiModelConfigured(settings.ai_model) && wantsAiCode({ subject, text, html, plain: body.plain })) {
         try {
           const usage = await bumpCounter(env, 'ai-extract', domain, dayWindow(), 1);
           if (usage.count <= DAILY_AI_EXTRACT_LIMIT) {
-            const aiCode = await extractCodeByAi(env, { subject, text, html });
+            const aiCode = await extractCodeByAi(settings.ai_model, { subject, text, html, plain: body.plain });
             if (aiCode) {
               finalCode = aiCode;
-              await db
+              // 回写验证码与通知入队并行，各自失败互不影响
+              codeSaved = Promise.resolve(db
                 .update(messages)
                 .set({ verificationCode: aiCode })
-                .where(eq(messages.id, messageId));
+                .where(eq(messages.id, messageId)))
+                .then(() => undefined, (e: unknown) => console.error('AI 提码失败:', e));
             }
           } else {
             console.warn(`域名 ${domain} 今日 AI 提码额度已用尽，跳过兜底识别`);
@@ -465,37 +400,13 @@ export async function handleInbound(
           console.error('AI 提码失败:', e);
         }
       }
-      for (const prefs of ownerPrefs) {
-        try {
-          await sendFeishuNotification(prefs.feishu, {
-            subject,
-            fromAddress,
-            fromName,
-            toAddress,
-            code: finalCode,
-            body: text || htmlToText(html),
-          });
-        } catch (e) {
-          console.error('飞书通知失败:', e);
-        }
-        try {
-          await sendNotifyWebhook(prefs.webhook, {
-            event: 'mail.received',
-            message: {
-              id: messageId,
-              address: toAddress,
-              fromAddress,
-              fromName,
-              subject,
-              verificationCode: finalCode,
-              preview,
-              createdAt: new Date().toISOString(),
-            },
-          });
-        } catch (e) {
-          console.error('通用 webhook 失败:', e);
-        }
-      }
+      await Promise.all([codeSaved, enqueueMailNotifications(env, ctx, {
+        ownerIds,
+        owners: await ownersReady,
+        message: { id: messageId, address: toAddress, fromAddress, fromName, subject,
+          verificationCode: finalCode, verificationLink, preview, createdAt: new Date().toISOString() },
+        text, html, mailText: body,
+      })]);
     })(),
   );
 }

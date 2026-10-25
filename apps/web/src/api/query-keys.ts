@@ -1,25 +1,39 @@
 import type { ListMessagesQuery } from '@hpc-mail/shared';
+import type { QueryClient } from '@tanstack/react-query';
 
 /** 集中式 query key 注册表：前缀分层，失效时按前缀 invalidate。 */
 export const queryKeys = {
   config: ['config', 'public'] as const,
   domains: ['domains', 'visible'] as const,
   notifyPrefs: ['notify-prefs'] as const,
+  notificationHealth: ['notification-health'] as const,
   session: ['session'] as const,
+  sessionForRevision: (revision: number) => ['session', revision] as const,
 
   mailboxes: {
     root: ['mailboxes'] as const,
     list: (scope: 'mine' | 'all') => ['mailboxes', 'list', scope] as const,
     availability: (localPart: string, domain: string) =>
       ['mailboxes', 'availability', domain, localPart] as const,
+    shared: ['mailboxes', 'shared'] as const,
+    shares: ['mailboxes', 'shares'] as const,
+    shareUsers: (q: string, excludeUserId?: number) => ['mailboxes', 'share-users', q, excludeUserId] as const,
+    /** 管理员按 id 读单个邮箱；挂在 mailboxes 下，所有权变化时随 root 一起失效 */
+    adminDetail: (id: number) => ['mailboxes', 'admin-detail', id] as const,
   },
 
   messages: {
     root: ['messages'] as const,
+    lists: ['messages', 'list'] as const,
     list: (filters: Partial<ListMessagesQuery>) => ['messages', 'list', filters] as const,
+    details: ['messages', 'detail'] as const,
     detail: (id: number, view?: { scope?: string; userId?: number }) =>
       ['messages', 'detail', id, view] as const,
+    thread: (id: number, view?: { scope?: string; userId?: number }) =>
+      ['messages', 'thread', id, view] as const,
     unreadCount: ['messages', 'unread-count'] as const,
+    /** 往来联系人（写信收件人自动补全） */
+    contacts: ['messages', 'contacts'] as const,
   },
 
   apiKeys: {
@@ -27,10 +41,34 @@ export const queryKeys = {
     list: (scope: 'mine' | 'admin') => ['api-keys', 'list', scope] as const,
   },
 
+  /** 托管域名：我拥有的与共享给我的；管理员查看他人域名的详情也挂在这里 */
+  hostedDomains: {
+    root: ['hosted-domains'] as const,
+    list: ['hosted-domains', 'list'] as const,
+    detail: (id: number) => ['hosted-domains', 'detail', id] as const,
+    members: (id: number) => ['hosted-domains', 'members', id] as const,
+    dnsRecords: (id: number) => ['hosted-domains', 'dns-records', id] as const,
+  },
+
   admin: {
     users: ['admin', 'users'] as const,
+    userSearch: (q: string, excludeUserId?: number) => ['admin', 'users', 'search', q, excludeUserId] as const,
     settings: ['admin', 'settings'] as const,
     invites: ['admin', 'invites'] as const,
     domainStatus: (domain: string) => ['admin', 'domain-status', domain] as const,
+    domainClaudeStats: ['admin', 'domain-claude-stats'] as const,
+    mailboxShares: ['admin', 'mailbox-shares'] as const,
+    mailboxSharesOf: (mailboxId: number) => ['admin', 'mailbox-shares', mailboxId] as const,
+    hostedDomains: ['admin', 'hosted-domains'] as const,
+    hostedDomainList: (filters: { status?: string; q?: string }) => ['admin', 'hosted-domains', filters] as const,
+    hostedDomainsHealth: ['admin', 'hosted-domains-health'] as const,
   },
 } as const;
+
+/** Ownership changes affect visibility, counts and administration together. Drop old private mail first. */
+export function invalidateMailboxOwnership(client: QueryClient): void {
+  void client.resetQueries({ queryKey: queryKeys.messages.root });
+  for (const queryKey of [queryKeys.mailboxes.root, queryKeys.admin.users, queryKeys.admin.mailboxShares]) {
+    void client.invalidateQueries({ queryKey });
+  }
+}

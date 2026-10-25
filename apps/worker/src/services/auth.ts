@@ -5,7 +5,7 @@ import type {
   RegisterRequest,
   SessionUser,
 } from '@hpc-mail/shared';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { sha256Hex } from '../lib/crypto.js';
@@ -19,7 +19,8 @@ import { avatarUrl } from './avatar.js';
 import { getSystemFromAddress } from './domain.js';
 import { sendFeishuNotification } from './feishu.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
-import { getUserEpoch, bumpUserEpoch, createSession, destroySession } from './session.js';
+import { sendPushDeerNotification } from './pushdeer.js';
+import { getUserEpoch, mirrorUserEpoch, createSession, destroySession } from './session.js';
 import { getSettings } from './setting.js';
 
 const LOGIN_WINDOW_SECONDS = 15 * 60;
@@ -136,23 +137,25 @@ async function verifyLoginTwoFactor(
   throw new AppError('bad_credentials', '两步验证码错误');
 }
 
-async function issueToken(env: Env, userId: number): Promise<string> {
-  const [sid, uepoch] = await Promise.all([
-    createSession(env, userId),
-    getUserEpoch(env, userId),
-  ]);
-  return signToken(env.jwt_secret, { sub: userId, sid, epoch: 0, uepoch });
+/** 签发会话令牌；ctx 用于把会话 KV 兼容写放进 waitUntil，不阻塞响应 */
+async function issueToken(env: Env, user: typeof users.$inferSelect, ctx?: ExecCtx | null): Promise<string> {
+  const sid = await createSession(env, user.id, user, ctx);
+  return signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: user.authVersion });
 }
 
 export async function login(
   env: Env,
   req: LoginRequest,
   ip: string,
-  ctx?: ExecCtx,
+  ctx?: ExecCtx | null,
 ): Promise<LoginResponse> {
   await assertLoginAllowed(env, req.username, ip);
   const db = createDb(env);
-  const user = await db.select().from(users).where(eq(users.username, req.username)).get();
+  let user = await db.select().from(users).where(eq(users.username, req.username)).get();
+  if (user && !user.authVersionMigrated) {
+    await getUserEpoch(env, user.id);
+    user = await db.select().from(users).where(eq(users.id, user.id)).get();
+  }
   const valid = user ? await verifyPassword(req.password, user.passwordHash) : false;
   if (!user || !valid) {
     await recordLoginFailure(env, req.username, ip);
@@ -170,6 +173,7 @@ export async function login(
     throw e;
   }
 
+  const token = await issueToken(env, user, ctx);
   await resetLoginFailures(env, req.username, ip);
   const previousIp = user.lastLoginIp;
   await db
@@ -183,26 +187,42 @@ export async function login(
       (async () => {
         try {
           const prefs = await getUserNotifyPrefs(env, user.id);
-          await sendFeishuNotification(prefs.feishu, {
-            subject: `⚠ 账号 ${user.username} 新 IP 登录`,
-            fromAddress: await getSystemFromAddress(env),
-            fromName: 'HPC Mail',
-            toAddress: user.username,
-            code: '',
-            body: `本次登录 IP：${ip}\n上次登录 IP：${previousIp}\n若非本人操作，请立即修改密码。`,
-          });
+          const systemFrom = await getSystemFromAddress(env);
+          try {
+            await sendFeishuNotification(prefs.feishu, {
+              subject: `⚠ 账号 ${user.username} 新 IP 登录`,
+              fromAddress: systemFrom,
+              fromName: 'HPC Mail',
+              toAddress: user.username,
+              code: '',
+              body: `本次登录 IP：${ip}\n上次登录 IP：${previousIp}\n若非本人操作，请立即修改密码。`,
+            });
+          } catch (e) {
+            console.error('新 IP 登录飞书告警失败:', e);
+          }
+          try {
+            await sendPushDeerNotification(prefs.pushdeer, {
+              subject: `⚠ 账号 ${user.username} 新 IP 登录`,
+              fromAddress: systemFrom,
+              fromName: 'HPC Mail',
+              toAddress: user.username,
+              code: '',
+              body: `本次登录 IP：${ip}\n上次登录 IP：${previousIp}\n若非本人操作，请立即修改密码。`,
+            });
+          } catch (e) {
+            console.error('新 IP 登录 PushDeer 告警失败:', e);
+          }
         } catch (e) {
-          console.error('新 IP 登录告警失败:', e);
+          console.error('新 IP 登录告警异常:', e);
         }
       })(),
     );
   }
 
-  const token = await issueToken(env, user.id);
   return { token, user: toSessionUser(user) };
 }
 
-export async function register(env: Env, req: RegisterRequest, ip: string): Promise<LoginResponse> {
+export async function register(env: Env, req: RegisterRequest, ip: string, ctx?: ExecCtx | null): Promise<LoginResponse> {
   await assertRegisterAllowed(env, ip);
   await recordRegisterAttempt(env, ip);
   const settings = await getSettings(env);
@@ -260,7 +280,7 @@ export async function register(env: Env, req: RegisterRequest, ip: string): Prom
       .returning();
   }
   if (!row) throw new AppError('internal', '用户创建失败');
-  const token = await issueToken(env, row!.id);
+  const token = await issueToken(env, row!, ctx);
   return { token, user: toSessionUser(row!) };
 }
 
@@ -268,6 +288,7 @@ export async function changePassword(
   env: Env,
   user: AuthUser,
   req: ChangePasswordRequest,
+  ctx?: ExecCtx | null,
 ): Promise<LoginResponse> {
   const db = createDb(env);
   const row = await db.select().from(users).where(eq(users.id, user.id)).get();
@@ -276,13 +297,16 @@ export async function changePassword(
     throw new AppError('bad_credentials', '原密码错误');
   }
   const passwordHash = await hashPassword(req.newPassword);
-  await db.update(users).set({ passwordHash }).where(eq(users.id, user.id));
-  await bumpUserEpoch(env, user.id);
-  // 旧会话全部失效，签发新 token 保持当前会话
-  const token = await issueToken(env, user.id);
-  return { token, user: toSessionUser(row) };
+  const updated = await db.update(users).set({ passwordHash,
+    authVersion: sql`${users.authVersion} + 1`, authVersionMigrated: true })
+    .where(and(eq(users.id, user.id), eq(users.passwordHash, row.passwordHash), eq(users.authVersion, row.authVersion)))
+    .returning().get();
+  if (!updated) throw new AppError('conflict', '密码已在另一请求中修改，请重新登录');
+  await mirrorUserEpoch(env, user.id, updated.authVersion, ctx);
+  const token = await issueToken(env, updated, ctx);
+  return { token, user: toSessionUser(updated) };
 }
 
-export async function logout(env: Env, sid: string): Promise<void> {
-  await destroySession(env, sid);
+export async function logout(env: Env, sid: string, ctx?: ExecCtx | null): Promise<void> {
+  await destroySession(env, sid, ctx);
 }

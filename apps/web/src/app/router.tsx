@@ -1,58 +1,76 @@
-import { lazy, Suspense } from 'react';
+import type { ComponentType } from 'react';
 import { createBrowserRouter, Navigate } from 'react-router-dom';
+import { LoginPage } from '@/features/auth/login-page';
 import { AdminGuard } from './admin-guard';
 import { AuthGuard } from './auth-guard';
-import { FullScreenLoader } from './page-loader';
+import { lazyWithReload } from './chunk-reload';
 import { NotFoundPage } from './not-found-page';
+import { PageLoader } from './page-loader';
 import { RouteErrorPage } from './route-error-page';
+import {
+  loadApiKeysPage,
+  loadComposePage,
+  loadHostedDomainDetailPage,
+  loadHostedDomainsPage,
+  loadInboxPage,
+  loadMailboxesPage,
+  loadMessagePage,
+  loadProfilePage,
+  loadSentPage,
+  loadStarredPage,
+  loadTrashPage,
+  type ModuleLoader,
+  preloadable,
+} from './route-modules';
 
-const LoginPage = lazy(() => import('@/features/auth/login-page').then((m) => ({ default: m.LoginPage })));
-const InboxPage = lazy(() => import('@/features/inbox/inbox-page').then((m) => ({ default: m.InboxPage })));
-const MessagePage = lazy(() => import('@/features/message/message-page').then((m) => ({ default: m.MessagePage })));
-const ComposePage = lazy(() => import('@/features/compose/compose-page').then((m) => ({ default: m.ComposePage })));
-const SentPage = lazy(() => import('@/features/sent/sent-page').then((m) => ({ default: m.SentPage })));
-const StarredPage = lazy(() =>
-  import('@/features/starred/starred-page').then((m) => ({ default: m.StarredPage })),
+/** 路由默认标签页标题；外壳读取最深一层的 handle.title，页面可用 useDocumentTitle 覆盖 */
+export interface RouteHandle {
+  title?: string;
+}
+const title = (value: string): RouteHandle => ({ title: value });
+
+const page = <M,>(load: ModuleLoader<M>, pick: (module: M) => ComponentType) =>
+  lazyWithReload(load, pick, <PageLoader />);
+
+const InboxPage = page(loadInboxPage, (m) => m.InboxPage);
+const MessagePage = page(loadMessagePage, (m) => m.MessagePage);
+const ComposePage = page(loadComposePage, (m) => m.ComposePage);
+const SentPage = page(loadSentPage, (m) => m.SentPage);
+const StarredPage = page(loadStarredPage, (m) => m.StarredPage);
+const TrashPage = page(loadTrashPage, (m) => m.TrashPage);
+const MailboxesPage = page(loadMailboxesPage, (m) => m.MailboxesPage);
+const HostedDomainsPage = page(loadHostedDomainsPage, (m) => m.HostedDomainsPage);
+const HostedDomainDetailPage = page(loadHostedDomainDetailPage, (m) => m.HostedDomainDetailPage);
+const ApiKeysPage = page(loadApiKeysPage, (m) => m.ApiKeysPage);
+const ProfilePage = page(loadProfilePage, (m) => m.ProfilePage);
+const UsersPage = page(preloadable(() => import('@/features/admin/users/users-page')), (m) => m.UsersPage);
+const AdminUserMailPage = page(
+  preloadable(() => import('@/features/admin/users/admin-user-mail-page')),
+  (m) => m.AdminUserMailPage,
 );
-const TrashPage = lazy(() =>
-  import('@/features/trash/trash-page').then((m) => ({ default: m.TrashPage })),
+const AdminMailPage = page(preloadable(() => import('@/features/admin/mail/admin-mail-page')), (m) => m.AdminMailPage);
+const InvitesPage = page(preloadable(() => import('@/features/admin/invites/invites-page')), (m) => m.InvitesPage);
+const DomainsPage = page(preloadable(() => import('@/features/admin/domains/domains-page')), (m) => m.DomainsPage);
+const AdminHostedDomainsPage = page(
+  preloadable(() => import('@/features/admin/hosted-domains/admin-hosted-domains-page')),
+  (m) => m.AdminHostedDomainsPage,
 );
-const MailboxesPage = lazy(() =>
-  import('@/features/mailboxes/mailboxes-page').then((m) => ({ default: m.MailboxesPage })),
+const SettingsPage = page(preloadable(() => import('@/features/admin/settings/settings-page')), (m) => m.SettingsPage);
+const AuditPage = page(preloadable(() => import('@/features/admin/audit/audit-page')), (m) => m.AuditPage);
+const AddressesPage = page(
+  preloadable(() => import('@/features/admin/addresses/addresses-page')),
+  (m) => m.AddressesPage,
 );
-const ApiKeysPage = lazy(() => import('@/features/api-keys/api-keys-page').then((m) => ({ default: m.ApiKeysPage })));
-const ProfilePage = lazy(() => import('@/features/profile/profile-page').then((m) => ({ default: m.ProfilePage })));
-const UsersPage = lazy(() => import('@/features/admin/users/users-page').then((m) => ({ default: m.UsersPage })));
-const AdminUserMailPage = lazy(() =>
-  import('@/features/admin/users/admin-user-mail-page').then((m) => ({ default: m.AdminUserMailPage })),
-);
-const AdminMailPage = lazy(() =>
-  import('@/features/admin/mail/admin-mail-page').then((m) => ({ default: m.AdminMailPage })),
-);
-const InvitesPage = lazy(() =>
-  import('@/features/admin/invites/invites-page').then((m) => ({ default: m.InvitesPage })),
-);
-const DomainsPage = lazy(() =>
-  import('@/features/admin/domains/domains-page').then((m) => ({ default: m.DomainsPage })),
-);
-const SettingsPage = lazy(() =>
-  import('@/features/admin/settings/settings-page').then((m) => ({ default: m.SettingsPage })),
-);
-const AuditPage = lazy(() =>
-  import('@/features/admin/audit/audit-page').then((m) => ({ default: m.AuditPage })),
-);
-const AddressesPage = lazy(() =>
-  import('@/features/admin/addresses/addresses-page').then((m) => ({ default: m.AddressesPage })),
+const AdminAddressMailPage = page(
+  preloadable(() => import('@/features/admin/addresses/address-mail-page')),
+  (m) => m.AdminAddressMailPage,
 );
 
 export const router = createBrowserRouter([
   {
     path: '/login',
-    element: (
-      <Suspense fallback={<FullScreenLoader />}>
-        <LoginPage />
-      </Suspense>
-    ),
+    // 登录页静态打进入口：未登录首屏不再多一跳 chunk 请求
+    element: <LoginPage />,
     errorElement: <RouteErrorPage />,
   },
   {
@@ -61,31 +79,36 @@ export const router = createBrowserRouter([
     errorElement: <RouteErrorPage />,
     children: [
       { index: true, element: <Navigate to="/inbox" replace /> },
-      { path: 'inbox', element: <InboxPage /> },
-      { path: 'mail/:id', element: <MessagePage /> },
-      { path: 'compose', element: <ComposePage /> },
-      { path: 'sent', element: <SentPage /> },
-      { path: 'starred', element: <StarredPage /> },
-      { path: 'trash', element: <TrashPage /> },
-      { path: 'mailboxes', element: <MailboxesPage /> },
-      { path: 'api-keys', element: <ApiKeysPage /> },
-      { path: 'profile', element: <ProfilePage /> },
+      { path: 'inbox', element: <InboxPage />, handle: title('收件箱') },
+      { path: 'mail/:id', element: <MessagePage />, handle: title('邮件详情') },
+      { path: 'compose', element: <ComposePage />, handle: title('写邮件') },
+      { path: 'sent', element: <SentPage />, handle: title('已发送') },
+      { path: 'starred', element: <StarredPage />, handle: title('星标') },
+      { path: 'trash', element: <TrashPage />, handle: title('回收站') },
+      { path: 'mailboxes', element: <MailboxesPage />, handle: title('我的邮箱') },
+      { path: 'domains', element: <HostedDomainsPage />, handle: title('我的域名') },
+      { path: 'domains/:id', element: <HostedDomainDetailPage />, handle: title('域名详情') },
+      { path: 'api-keys', element: <ApiKeysPage />, handle: title('API Keys') },
+      { path: 'profile', element: <ProfilePage />, handle: title('个人设置') },
       {
         path: 'admin',
         element: <AdminGuard />,
         children: [
           { index: true, element: <Navigate to="/admin/users" replace /> },
-          { path: 'users', element: <UsersPage /> },
-          { path: 'users/:userId/mail', element: <AdminUserMailPage /> },
-          { path: 'mail', element: <AdminMailPage /> },
-          { path: 'invites', element: <InvitesPage /> },
-          { path: 'domains', element: <DomainsPage /> },
-          { path: 'addresses', element: <AddressesPage /> },
-          { path: 'settings', element: <SettingsPage /> },
-          { path: 'audit', element: <AuditPage /> },
+          { path: 'users', element: <UsersPage />, handle: title('用户管理') },
+          { path: 'users/:userId/mail', element: <AdminUserMailPage />, handle: title('用户邮件') },
+          { path: 'mail', element: <AdminMailPage />, handle: title('全站邮件') },
+          { path: 'invites', element: <InvitesPage />, handle: title('邀请码') },
+          { path: 'domains', element: <DomainsPage />, handle: title('收件域名') },
+          { path: 'hosted-domains', element: <AdminHostedDomainsPage />, handle: title('托管域名') },
+          { path: 'addresses', element: <AddressesPage />, handle: title('全站地址') },
+          { path: 'addresses/:mailboxId/mail', element: <AdminAddressMailPage />, handle: title('地址邮件') },
+          { path: 'shared-mailboxes', element: <Navigate to="/admin/addresses" replace /> },
+          { path: 'settings', element: <SettingsPage />, handle: title('系统设置') },
+          { path: 'audit', element: <AuditPage />, handle: title('操作审计') },
         ],
       },
-      { path: '*', element: <NotFoundPage /> },
+      { path: '*', element: <NotFoundPage />, handle: title('页面不存在') },
     ],
   },
 ]);

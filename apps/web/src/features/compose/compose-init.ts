@@ -7,6 +7,7 @@ export interface ComposeInitial {
   fromAddress?: string;
   to?: string[];
   cc?: string[];
+  bcc?: string[];
   subject?: string;
   body?: string;
   isHtml?: boolean;
@@ -16,6 +17,8 @@ export interface ComposeInitial {
   forwardAttachmentsFrom?: number;
   /** 页面标题用；不靠主题前缀猜测（中文「转发:」会误判） */
   mode?: 'reply' | 'forward' | 'resend';
+  /** 来源邮件 id：决定草稿场景（reply:/forward:/resend:<id>），各场景草稿互不覆盖 */
+  sourceMessageId?: number;
 }
 
 function withPrefix(subject: string, prefix: 'Re' | 'Fwd'): string {
@@ -58,7 +61,7 @@ function quotedBody(message: MessageDetail): string {
 /** 从一封邮件回复：outbound 回给原收件人，inbound 回给发件人 */
 export function buildReply(message: MessageDetail): ComposeInitial {
   const outbound = message.direction === 'outbound';
-  const to = outbound ? message.recipients.to : [message.fromAddress];
+  const to = outbound ? message.recipients.to : message.replyTo?.length ? message.replyTo : [message.fromAddress];
   return {
     fromAddress: message.address,
     to: to.filter(Boolean),
@@ -67,6 +70,7 @@ export function buildReply(message: MessageDetail): ComposeInitial {
     isHtml: false,
     replyToMessageId: message.id,
     mode: 'reply',
+    sourceMessageId: message.id,
   };
 }
 
@@ -74,7 +78,7 @@ export function buildReply(message: MessageDetail): ComposeInitial {
 export function buildReplyAll(message: MessageDetail): ComposeInitial {
   const self = message.address.toLowerCase();
   const outbound = message.direction === 'outbound';
-  const primary = outbound ? message.recipients.to : [message.fromAddress];
+  const primary = outbound ? message.recipients.to : message.replyTo?.length ? message.replyTo : [message.fromAddress];
   const others = [...message.recipients.to, ...message.recipients.cc].filter(
     (addr) => addr.toLowerCase() !== self && !primary.includes(addr),
   );
@@ -87,6 +91,7 @@ export function buildReplyAll(message: MessageDetail): ComposeInitial {
     isHtml: false,
     replyToMessageId: message.id,
     mode: 'reply',
+    sourceMessageId: message.id,
   };
 }
 
@@ -103,18 +108,27 @@ export function buildForward(message: MessageDetail): ComposeInitial {
     isHtml: false,
     forwardAttachmentsFrom: hasAttachments ? message.id : undefined,
     mode: 'forward',
+    sourceMessageId: message.id,
   };
 }
 
 /** 重新发送一封失败的外发邮件：沿用原收件人/主题/正文，让用户可修正后重发 */
-export function buildResend(message: MessageDetail): ComposeInitial {
+export function buildResend(message: MessageDetail, failedOnly = false): ComposeInitial {
+  const failures = new Set((message.recipientOutcomes ?? []).filter((outcome) => outcome.status === 'failed').map((outcome) => outcome.address.toLowerCase()));
+  const recipients = (addresses: string[]) => failedOnly ? addresses.filter((address) => failures.has(address.toLowerCase())) : addresses;
+  const to = recipients(message.recipients.to);
+  const cc = recipients(message.recipients.cc);
+  const bcc = recipients(message.recipients.bcc);
   return {
     fromAddress: message.address,
-    to: message.recipients.to,
-    cc: message.recipients.cc,
+    to,
+    cc,
+    bcc,
     subject: message.subject,
-    body: message.bodyText || (message.bodyHtml ? htmlToPlainText(message.bodyHtml) : ''),
-    isHtml: false,
+    body: message.bodyHtml || message.bodyText,
+    isHtml: Boolean(message.bodyHtml),
+    forwardAttachmentsFrom: message.attachments.length ? message.id : undefined,
     mode: 'resend',
+    sourceMessageId: message.id,
   };
 }
