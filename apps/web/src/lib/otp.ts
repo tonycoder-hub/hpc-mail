@@ -13,6 +13,8 @@ const PROXIMITY = 120;
 const KEYWORD_PATTERN =
   /验证码|校验码|动态码|动态密码|一次性密码|动态验证码|安全码|确认码|验证代码|口令|one[-\s]?time\s+(?:password|passcode)|passcode|pass\s?code|security\s?code|access\s?code|login\s?code|authentication\s?code|\bcode\b|\botp\b|\bpin\b|2fa/gi;
 
+/** 零宽、软连字符、方向控制等不可见字符：夹在码中间会把它切成两段，匹配前先去掉 */
+const INVISIBLE_PATTERN = new RegExp("[\\u200B-\\u200F\\u202A-\\u202E\\u2060\\uFEFF\\u00AD\\u034F]", "g");
 const DIGIT_PATTERN = /(?<![\w])\d{4,8}(?![\w])/g;
 const ALNUM_PATTERN = /(?<![\w])[A-Z0-9]{6,8}(?![\w])/g;
 const URL_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<>"']+/gi;
@@ -116,8 +118,8 @@ function rankField(text: string, source: OtpMatch['source']): Ranked[] {
 }
 
 export function extractOtp(subject: string | null | undefined, text: string | null | undefined): OtpMatch | null {
-  const normalizedSubject = subject ?? '';
-  const normalizedText = text ?? '';
+  const normalizedSubject = (subject ?? '').replace(INVISIBLE_PATTERN, '');
+  const normalizedText = (text ?? '').replace(INVISIBLE_PATTERN, '');
   const corpus = `${normalizedSubject}\n${normalizedText}`;
   if (LINK_ONLY_PATTERN.test(corpus) && !EXPLICIT_CODE_PATTERN.test(withoutUrls(corpus))) return null;
   const ranked = [...rankField(normalizedSubject, 'subject'), ...rankField(normalizedText, 'body')];

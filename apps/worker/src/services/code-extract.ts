@@ -1,4 +1,4 @@
-import { htmlToText } from '../lib/text.js';
+import { htmlToText, stripInvisible } from '../lib/text.js';
 import { chatJson, isAiModelConfigured, type AiModelConfig } from './ai-provider.js';
 
 /** 验证码上下文关键词 */
@@ -86,7 +86,8 @@ function withoutUrls(text: string): string {
 }
 
 function corpusOf(subject: string, body: string): string {
-  return `${subject || ''}\n${(body || '').slice(0, CODE_SCAN_BODY_CHARS)}`;
+  // 零宽字符会把码切成两段（6 位只剩 5 位），text/plain 正文得在这里归一化
+  return stripInvisible(`${subject || ''}\n${(body || '').slice(0, CODE_SCAN_BODY_CHARS)}`);
 }
 
 /** 有序数组中离 index 最近的关键词距离（二分） */
@@ -209,7 +210,11 @@ interface AiCodeInput {
 
 function aiCorpus(input: AiCodeInput): { subject: string; body: string } {
   const body = input.plain ?? (input.text || htmlToText(input.html));
-  return { subject: input.subject || '', body: body.slice(0, AI_CODE_BODY_CHARS) };
+  // 与正则同一口径：模型看到的和回验用的都是去掉不可见字符后的正文
+  return {
+    subject: stripInvisible(input.subject || ''),
+    body: stripInvisible(body.slice(0, AI_CODE_BODY_CHARS)),
+  };
 }
 
 /** 值得交给模型兜底：有内容、出现验证码相关词，且不是只让点链接的邮件 */

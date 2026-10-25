@@ -9,6 +9,7 @@ import {
   validateLocalPart,
 } from '../src/lib/email-address.js';
 import { extractCodeByRegex, resolveVerificationCode } from '../src/services/code-extract.js';
+import { htmlToText, makePreview } from '../src/lib/text.js';
 import { injectAttachmentLinks } from '../src/services/outbound.js';
 import { ipInAllowList } from '../src/lib/ip-allowlist.js';
 import {
@@ -144,6 +145,61 @@ describe('code-extract 正则', () => {
   });
   it('非 link-only 邮件保留无法被正则覆盖的历史/AI 验证码', () => {
     expect(resolveVerificationCode('Account alert', 'Use the password shown in the app.', '739204')).toBe('739204');
+  });
+
+  /** HTML 在码中间插入的标签或零宽字符一度把 6 位码切成 5 位（只剩较长的那一截） */
+  it.each([
+    ['行内加粗', '<p>Your verification code is <b>913</b>472</p>'],
+    ['逐段 span', '<p>Your verification code is <span>91347</span><span>2</span></p>'],
+    ['font 标签', '<p>Your verification code is 9134<font color="#000">72</font></p>'],
+    ['wbr 断词', '<p>Your verification code is 913<wbr>472</p>'],
+    ['零宽空格', '<p>Your verification code is 91347\u200B2</p>'],
+    ['软连字符', '<p>Your verification code is 91347\u00AD2</p>'],
+    ['方向控制符', '<p>Your verification code is 9134\u200E72</p>'],
+    ['数字实体零宽空格', '<p>Your verification code is 91347&#8203;2</p>'],
+    ['十六进制实体零宽空格', '<p>Your verification code is 91347&#x200B;2</p>'],
+    ['命名实体 zwnj', '<p>Your verification code is 91347&zwnj;2</p>'],
+    ['隐藏元素里的零宽空格', '<p>Your verification code is 91347<span style="display:none">&#8203;</span>2</p>'],
+  ])('HTML 的 %s 不把 6 位码切断', (_name, html) => {
+    expect(extractCodeByRegex('Verify your sign-in', htmlToText(html))).toBe('913472');
+  });
+
+  it('纯文本正文里的零宽字符不影响摘要重新校验提码', () => {
+    const text = '您的验证码是 91347\u200B2，请勿泄露';
+    expect(extractCodeByRegex('', text)).toBe('913472');
+    expect(resolveVerificationCode('', makePreview(text, ''), '')).toBe('913472');
+  });
+});
+
+describe('htmlToText', () => {
+  it('行内文字标签不产生空白，结构标签仍然分隔', () => {
+    expect(htmlToText('<p>Order <b>#12</b>345</p>')).toBe('Order #12345');
+    expect(htmlToText('<table><tr><td>Hello</td><td>World</td></tr></table>')).toBe('Hello World');
+    expect(htmlToText('<div>a</div><div>b</div>')).toBe('a\n b');
+  });
+
+  it('不可见字符直接去掉，真正占位的空格仍折叠为普通空格', () => {
+    expect(htmlToText('<p>ab\u200Bcd</p>')).toBe('abcd');
+    expect(htmlToText('<p>ab\u00A0cd</p>')).toBe('ab cd');
+    expect(htmlToText('<p>ab&#160;cd</p>')).toBe('ab cd');
+    expect(htmlToText('<p>ab\u3000cd</p>')).toBe('ab cd');
+    expect(htmlToText('<p>ab&nbsp;cd</p>')).toBe('ab cd');
+  });
+
+  it('解码数字与十六进制实体，非法码位丢弃', () => {
+    expect(htmlToText('<p>&#72;&#105; &#x41;&#x42;</p>')).toBe('Hi AB');
+    expect(htmlToText('<p>it&#39;s</p>')).toBe("it's");
+    expect(htmlToText('<p>a&#x110000;b</p>')).toBe('ab');
+  });
+
+  it('&amp;#8203; 这类字面量不被当成零宽空格二次解码', () => {
+    expect(htmlToText('<p>91347&amp;#8203;2</p>')).toBe('91347&#8203;2');
+  });
+
+  it('脚本、样式与既有实体行为不变', () => {
+    expect(htmlToText('<head><style>.x{color:red}</style></head><body><p>hi</p></body>')).toBe('hi');
+    expect(htmlToText('<p>a &lt;b&gt; &quot;c&quot; &amp; d</p>')).toBe('a <b> "c" & d');
+    expect(htmlToText('<p>line1<br>line2</p>')).toBe('line1\nline2');
   });
 });
 

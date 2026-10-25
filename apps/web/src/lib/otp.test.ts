@@ -55,4 +55,14 @@ describe('extractOtp', () => {
     const body = 'Your verification code is 482913. Or click https://example.test/verify/A1B2C3';
     expect(extractOtp('Verify your account', body)).toEqual({ code: '482913', source: 'body' });
   });
+
+  /** 零宽字符夹在码中间时，匹配前不归一化就只剩前 5 位 */
+  it.each([
+    ['零宽空格', '\u200B'],
+    ['软连字符', '\u00AD'],
+    ['方向控制符', '\u200E'],
+  ])('正文里的%s不把 6 位码切断', (_name, invisible) => {
+    expect(extractOtp('Verify your sign-in', `Your verification code is 91347${invisible}2`))
+      .toEqual({ code: '913472', source: 'body' });
+  });
 });
