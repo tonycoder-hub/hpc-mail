@@ -8,7 +8,12 @@ import {
   normalizeEmail,
   validateLocalPart,
 } from '../src/lib/email-address.js';
-import { extractCodeByRegex, resolveVerificationCode } from '../src/services/code-extract.js';
+import {
+  CODE_SCAN_BODY_CHARS,
+  extractCodeByRegex,
+  resolveVerificationCode,
+} from '../src/services/code-extract.js';
+import { htmlToText, makePreview, PREVIEW_LIMIT } from '../src/lib/text.js';
 import { injectAttachmentLinks } from '../src/services/outbound.js';
 import { ipInAllowList } from '../src/lib/ip-allowlist.js';
 import {
@@ -144,6 +149,124 @@ describe('code-extract 正则', () => {
   });
   it('非 link-only 邮件保留无法被正则覆盖的历史/AI 验证码', () => {
     expect(resolveVerificationCode('Account alert', 'Use the password shown in the app.', '739204')).toBe('739204');
+  });
+
+  /** HTML 在码中间插入的标签或零宽字符一度把 6 位码切成 5 位（只剩较长的那一截） */
+  it.each([
+    ['行内加粗', '<p>Your verification code is <b>913</b>472</p>'],
+    ['逐段 span', '<p>Your verification code is <span>91347</span><span>2</span></p>'],
+    ['font 标签', '<p>Your verification code is 9134<font color="#000">72</font></p>'],
+    ['wbr 断词', '<p>Your verification code is 913<wbr>472</p>'],
+    ['零宽空格', '<p>Your verification code is 91347\u200B2</p>'],
+    ['软连字符', '<p>Your verification code is 91347\u00AD2</p>'],
+    ['方向控制符', '<p>Your verification code is 9134\u200E72</p>'],
+    ['数字实体零宽空格', '<p>Your verification code is 91347&#8203;2</p>'],
+    ['十六进制实体零宽空格', '<p>Your verification code is 91347&#x200B;2</p>'],
+    ['命名实体 zwnj', '<p>Your verification code is 91347&zwnj;2</p>'],
+    ['隐藏元素里的零宽空格', '<p>Your verification code is 91347<span style="display:none">&#8203;</span>2</p>'],
+  ])('HTML 的 %s 不把 6 位码切断', (_name, html) => {
+    expect(extractCodeByRegex('Verify your sign-in', htmlToText(html))).toBe('913472');
+  });
+
+  it('纯文本正文里的零宽字符不影响摘要重新校验提码', () => {
+    const text = '您的验证码是 91347\u200B2，请勿泄露';
+    expect(extractCodeByRegex('', text)).toBe('913472');
+    expect(resolveVerificationCode('', makePreview(text, ''), '')).toBe('913472');
+  });
+
+  /**
+   * 列表接口拿 160 字摘要重新校验提码：码跨在摘要边界上时只剩前几位，
+   * 而 \d{4,8} 对 4-5 位的残码照样成立，一度盖掉收件时按完整正文存下的 6 位码。
+   */
+  describe('摘要边界上的验证码', () => {
+    const filler = '你好，这是一封来自站点的通知邮件，感谢你注册账号并完成邮箱绑定。为了保护账号安全，请查收下面这次操作所需要的信息。';
+    const bodyWithCodeAt = (pad: number) =>
+      `${filler.repeat(3).slice(0, pad)}你的验证码：913472，五分钟内有效。`;
+
+    it.each([
+      ['切掉 1 位只剩 5 位', 149, '91347'],
+      ['切掉 2 位只剩 4 位', 150, '9134'],
+    ])('%s 的摘要不覆盖已存的完整码', (_name, pad, truncated) => {
+      const body = bodyWithCodeAt(pad as number);
+      const preview = makePreview(body, '');
+      // 完整正文始终提得出 6 位；摘要单独看确实只剩残码
+      expect(extractCodeByRegex('', body)).toBe('913472');
+      expect(preview).toHaveLength(PREVIEW_LIMIT);
+      expect(preview.endsWith(truncated as string)).toBe(true);
+      expect(extractCodeByRegex('', preview, { bodyTruncated: true })).toBe('');
+      expect(resolveVerificationCode('', preview, '913472', { bodyTruncated: true })).toBe('913472');
+    });
+
+    it('没取满上限的摘要末尾仍然正常提码', () => {
+      const preview = makePreview('您的验证码是 913472', '');
+      expect(preview.length).toBeLessThan(PREVIEW_LIMIT);
+      expect(resolveVerificationCode('', preview, '')).toBe('913472');
+    });
+
+    it('摘要中间的候选不受截断影响', () => {
+      const preview = makePreview(`你的验证码：913472，请在五分钟内使用。${filler.repeat(3)}`, '');
+      expect(preview).toHaveLength(PREVIEW_LIMIT);
+      expect(resolveVerificationCode('', preview, '', { bodyTruncated: true })).toBe('913472');
+    });
+
+    /**
+     * 真实回归用例：Apple 的「Verify your Apple Account email address.」。
+     * 它的前导句归一化后正好 154 字，6 位码落在第 155-161 字，摘要切在 160——
+     * 列表接口拿摘要重新提码只剩 5 位，详情页走完整正文仍是 6 位。
+     */
+    it('Apple 验证码邮件的码正好跨在摘要边界上', () => {
+      const body = [
+        "You've chosen this email address for your Apple Account. To verify this email address",
+        'belongs to you, enter the code below on the email verification page:',
+        '',
+        '472913',
+        '',
+        'This code will expire three hours after this email was sent.',
+      ].join('\n');
+      const subject = 'Verify your Apple Account email address.';
+      const preview = makePreview(body, '');
+
+      expect(extractCodeByRegex(subject, body)).toBe('472913');
+      expect(preview).toHaveLength(PREVIEW_LIMIT);
+      expect(preview.endsWith('47291')).toBe(true);
+      expect(resolveVerificationCode(subject, preview, '472913', { bodyTruncated: true })).toBe('472913');
+    });
+
+    it('正文超过提码扫描上限时贴着结尾的候选同样不可信', () => {
+      expect(extractCodeByRegex('', `你的验证码：${'。'.repeat(CODE_SCAN_BODY_CHARS)}913472`)).toBe('');
+    });
+  });
+});
+
+describe('htmlToText', () => {
+  it('行内文字标签不产生空白，结构标签仍然分隔', () => {
+    expect(htmlToText('<p>Order <b>#12</b>345</p>')).toBe('Order #12345');
+    expect(htmlToText('<table><tr><td>Hello</td><td>World</td></tr></table>')).toBe('Hello World');
+    expect(htmlToText('<div>a</div><div>b</div>')).toBe('a\n b');
+  });
+
+  it('不可见字符直接去掉，真正占位的空格仍折叠为普通空格', () => {
+    expect(htmlToText('<p>ab\u200Bcd</p>')).toBe('abcd');
+    expect(htmlToText('<p>ab\u00A0cd</p>')).toBe('ab cd');
+    expect(htmlToText('<p>ab&#160;cd</p>')).toBe('ab cd');
+    expect(htmlToText('<p>ab\u3000cd</p>')).toBe('ab cd');
+    expect(htmlToText('<p>ab&nbsp;cd</p>')).toBe('ab cd');
+  });
+
+  it('解码数字与十六进制实体，非法码位丢弃', () => {
+    expect(htmlToText('<p>&#72;&#105; &#x41;&#x42;</p>')).toBe('Hi AB');
+    expect(htmlToText('<p>it&#39;s</p>')).toBe("it's");
+    expect(htmlToText('<p>a&#x110000;b</p>')).toBe('ab');
+  });
+
+  it('&amp;#8203; 这类字面量不被当成零宽空格二次解码', () => {
+    expect(htmlToText('<p>91347&amp;#8203;2</p>')).toBe('91347&#8203;2');
+  });
+
+  it('脚本、样式与既有实体行为不变', () => {
+    expect(htmlToText('<head><style>.x{color:red}</style></head><body><p>hi</p></body>')).toBe('hi');
+    expect(htmlToText('<p>a &lt;b&gt; &quot;c&quot; &amp; d</p>')).toBe('a <b> "c" & d');
+    expect(htmlToText('<p>line1<br>line2</p>')).toBe('line1\nline2');
   });
 });
 

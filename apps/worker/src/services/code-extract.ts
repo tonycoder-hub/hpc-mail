@@ -1,4 +1,4 @@
-import { htmlToText } from '../lib/text.js';
+import { htmlToText, stripInvisible } from '../lib/text.js';
 import { chatJson, isAiModelConfigured, type AiModelConfig } from './ai-provider.js';
 
 /** 验证码上下文关键词 */
@@ -86,7 +86,8 @@ function withoutUrls(text: string): string {
 }
 
 function corpusOf(subject: string, body: string): string {
-  return `${subject || ''}\n${(body || '').slice(0, CODE_SCAN_BODY_CHARS)}`;
+  // 零宽字符会把码切成两段（6 位只剩 5 位），text/plain 正文得在这里归一化
+  return stripInvisible(`${subject || ''}\n${(body || '').slice(0, CODE_SCAN_BODY_CHARS)}`);
 }
 
 /** 有序数组中离 index 最近的关键词距离（二分） */
@@ -158,13 +159,31 @@ function collectCandidates(text: string, excluded: Range[], keywords: KeywordHit
   return out;
 }
 
+export interface CodeExtractOptions {
+  /**
+   * 传入的 body 本身已经是截断摘录（列表接口用的 160 字摘要），不是完整正文。
+   * 正文在 16KB 处被 {@link corpusOf} 截断时会自动识别，不用传这个。
+   */
+  bodyTruncated?: boolean;
+}
+
+/** 正文被截断时，贴着结尾的候选可能已经被切掉几位：6 位码只剩 5 位照样满足 \d{4,8} */
+function truncatedTail(body: string, options: CodeExtractOptions): boolean {
+  return options.bodyTruncated === true || (body || '').length > CODE_SCAN_BODY_CHARS;
+}
+
 /**
  * 纯正则提码：关键词 ±120 字符内的候选，多候选取距关键词最近者。
  * 只看主题 + 正文前 16KB；URL 区间用单调游标、关键词距离用二分，整体线性。
  * 导出为纯函数便于单测。
  */
-export function extractCodeByRegex(subject: string, body: string): string {
+export function extractCodeByRegex(
+  subject: string,
+  body: string,
+  options: CodeExtractOptions = {},
+): string {
   const corpus = corpusOf(subject, body);
+  const cutTail = truncatedTail(body, options);
   const excluded = urlRanges(corpus);
   const inUrl = rangeCursor(excluded);
   const keywords: KeywordHit[] = [];
@@ -178,6 +197,7 @@ export function extractCodeByRegex(subject: string, body: string): string {
 
   let best: { value: string; distance: number } | null = null;
   for (const cand of collectCandidates(corpus, excluded, keywords)) {
+    if (cutTail && cand.index + cand.value.length === corpus.length) continue;
     const distance = nearestKeywordDistance(keywords, cand.index);
     if (distance <= NEIGHBORHOOD && (best === null || distance < best.distance)) {
       best = { value: cand.value, distance };
@@ -189,11 +209,19 @@ export function extractCodeByRegex(subject: string, body: string): string {
 /**
  * 读取历史数据时重新校验已存验证码：新规则能提取时以新结果为准；明确的 link-only
  * 邮件则清掉旧版误识别值。其他邮件保留 AI/旧规则结果，避免破坏无法被正则覆盖的真验证码。
+ *
+ * body 是摘要这类截断文本时要带上 `bodyTruncated`，否则被切短的码会盖掉收件时
+ * 按完整正文存下的正确值（6 位码在摘要边界上只剩 5 位）。
  */
-export function resolveVerificationCode(subject: string, body: string, storedCode: string): string {
+export function resolveVerificationCode(
+  subject: string,
+  body: string,
+  storedCode: string,
+  options: CodeExtractOptions = {},
+): string {
   const corpus = corpusOf(subject, body);
   if (LINK_ONLY_REGEX.test(corpus) && !EXPLICIT_CODE_REGEX.test(withoutUrls(corpus))) return '';
-  const extracted = extractCodeByRegex(subject, body);
+  const extracted = extractCodeByRegex(subject, body, options);
   if (extracted) return extracted;
   if (!storedCode) return '';
   return storedCode;
@@ -209,7 +237,11 @@ interface AiCodeInput {
 
 function aiCorpus(input: AiCodeInput): { subject: string; body: string } {
   const body = input.plain ?? (input.text || htmlToText(input.html));
-  return { subject: input.subject || '', body: body.slice(0, AI_CODE_BODY_CHARS) };
+  // 与正则同一口径：模型看到的和回验用的都是去掉不可见字符后的正文
+  return {
+    subject: stripInvisible(input.subject || ''),
+    body: stripInvisible(body.slice(0, AI_CODE_BODY_CHARS)),
+  };
 }
 
 /** 值得交给模型兜底：有内容、出现验证码相关词，且不是只让点链接的邮件 */

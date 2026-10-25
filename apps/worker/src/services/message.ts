@@ -35,7 +35,7 @@ import { signAttachment } from '../lib/crypto.js';
 import { chunk, D1_PAIR_BATCH } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
-import { htmlToText } from '../lib/text.js';
+import { htmlToText, PREVIEW_LIMIT } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { isAiModelConfigured } from './ai-provider.js';
 import { CODE_SCAN_BODY_CHARS, resolveVerificationCode } from './code-extract.js';
@@ -273,6 +273,8 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
     row.subject,
     row.preview,
     row.verificationCode,
+    // 摘要是截断文本：取满上限时末尾的候选可能被切短，别让它盖掉收件时存的完整码
+    { bodyTruncated: row.preview.length >= PREVIEW_LIMIT },
   );
   return {
     id: row.id,
@@ -647,7 +649,9 @@ function hasReplyPrefix(subject: string): boolean {
 
 /** 与列表展示同一口径（读取时会重新校验已存验证码） */
 function hasCode(row: Pick<MessageRow, 'subject' | 'preview' | 'verificationCode'>): boolean {
-  return resolveVerificationCode(row.subject, row.preview, row.verificationCode) !== '';
+  return resolveVerificationCode(row.subject, row.preview, row.verificationCode, {
+    bodyTruncated: row.preview.length >= PREVIEW_LIMIT,
+  }) !== '';
 }
 
 async function isAddressClaimed(db: Db, address: string): Promise<boolean> {
